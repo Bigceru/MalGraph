@@ -80,7 +80,7 @@ class Vocab:
 
 if __name__ == '__main__':
     max_vocab_size = 1000
-    vocab = Vocab(freq_file="../../data/processed_dataset/train_external_function_name_vocab.jsonl", max_vocab_size=max_vocab_size)
+    vocab = Vocab(freq_file="./train_external_function_name_vocab.jsonl", max_vocab_size=max_vocab_size)
     print(len(vocab.token_2_index), vocab.token_2_index)
     print(len(vocab.index_2_token), vocab.index_2_token)
     print(vocab.unk_token, vocab.unk_idx)

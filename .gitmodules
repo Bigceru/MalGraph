@@ -1,0 +1,3 @@
+[submodule "Gencoding"]
+	path = Gencoding
+	url = https://github.com/qian-feng/Gencoding.git
