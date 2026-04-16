@@ -119,6 +119,8 @@ if __name__ == '__main__':
 
     vocabulary = Vocab(freq_file=args.vocab_file, max_vocab_size=args.max_vocab_size)
 
+    exit(0)
+
     # Cycle for all the JSON files in the output directory and convert them to PyG objects
     for root, _, files in os.walk(args.output_dir_json):
 

@@ -62,7 +62,8 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
         # self.device = device
         self.global_log = global_log
         
-        # Hierarchical 1: Control Flow Graph (CFG) embedding and pooling
+        # Stage 1 of the architecture: encode each sample's Control Flow Graph (CFG).
+        # The CFG encoder stacks graph convolutions followed by pooling into one vector per sample.
         print(type(model_params.cfg_filters), model_params.cfg_filters)
         if type(model_params.cfg_filters) == str:
             cfg_filter_list = [int(number_filter) for number_filter in model_params.cfg_filters.split("-")]
@@ -87,7 +88,8 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
         # self.dropout = nn.Dropout(p=model_params.dropout_rate).to(self.device)
         self.dropout = nn.Dropout(p=model_params.dropout_rate)
         
-        # Hierarchical 2: Function Call Graph (FCG) embedding and pooling
+        # Stage 2 of the architecture: combine CFG embeddings with external function-name embeddings,
+        # then process the Function Call Graph (FCG) with another graph encoder.
         self.external_embedding_layer = nn.Embedding(num_embeddings=external_vocab.max_vocab_size + 2, embedding_dim=cfg_filter_list[-1], padding_idx=external_vocab.pad_idx)
         print(type(model_params.fcg_filters), model_params.fcg_filters)
         if type(model_params.fcg_filters) == str:
@@ -110,7 +112,7 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
         for i in range(self.fcg_filter_length - 1):
             setattr(self, 'FCG_gnn_{}'.format(i + 1), fcg_constructor(**fcg_conv['kwargs'][i]))
         
-        # Last Projection Function: gradually project with more linear layers
+        # Final classifier head: reduce the graph representation to a single binary malware score.
         self.pj1 = Linear(in_features=fcg_filter_list[-1], out_features=int(fcg_filter_list[-1] / 2))
         self.pj2 = Linear(in_features=int(fcg_filter_list[-1] / 2), out_features=int(fcg_filter_list[-1] / 4))
         self.pj3 = Linear(in_features=int(fcg_filter_list[-1] / 4), out_features=1)
@@ -178,10 +180,12 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
     
     def forward(self, real_local_batch: Batch, real_bt_positions: list, bt_external_names: list, bt_all_function_edges: list, local_device: torch.device):
         
+        # Encode the CFG for all basic blocks and pool per binary before building the FCG stage.
         rtn_local_batch = self.forward_cfg_gnn(local_batch=real_local_batch)
         x_cfg_pool = self.aggregate_cfg_batch_pooling(local_batch=rtn_local_batch)
         
-        # build the Function Call Graph (FCG) Data/Batch datasets
+        # Reconstruct one function-level graph per binary in the batch.
+        # Each node starts with a pooled CFG embedding and may be augmented with an external-name embedding.
         assert len(real_bt_positions) - 1 == len(bt_external_names), "all should be equal to the batch size ... "
         assert len(real_bt_positions) - 1 == len(bt_all_function_edges), "all should be equal to the batch size ... "
         
@@ -202,12 +206,12 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
             
             fcg_list.append(idx_graph_data)
         fcg_batch = Batch.from_data_list(fcg_list)
-        # Hierarchical 2: Function Call Graph (FCG) embedding and pooling
+        # Encode the reconstructed FCGs and pool them into one vector per sample.
         rtn_fcg_batch = self.forward_fcg_gnn(function_batch=fcg_batch)  # [batch_size, max_node_size, dim]
         x_fcg_pool = self.aggregate_fcg_batch_pooling(function_batch=rtn_fcg_batch)  # [batch_size, 1, dim] => [batch_size, dim]
         batch_final = x_fcg_pool
         
-        # step last project to the number_of_numbers (binary)
+        # Binary prediction head with sigmoid output.
         bt_final_embed = self.pj3(self.pj2(self.pj1(batch_final)))
         bt_pred = self.last_activation(bt_final_embed)
         return bt_pred
