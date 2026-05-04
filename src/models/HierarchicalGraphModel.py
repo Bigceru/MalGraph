@@ -15,11 +15,23 @@ from utils.Vocabulary import Vocab  # noqa
 
 
 def div_with_small_value(n, d, eps=1e-8):
+    """Safe division: divide n by d but avoid division-by-zero.
+
+    Replaces any denominator values <= eps with eps so numerical
+    operations remain stable (used in attention / normalization).
+    """
     d = d * (d > eps).float() + eps * (d <= eps).float()
     return n / d
 
 
 def padding_tensors(tensor_list):
+    """Pad a list of 2D+ tensors to a single tensor batch with masks.
+
+    Inputs are assumed to have shape [num_nodes, feat_dim,...].
+    Returns: (padded_tensor, mask) where mask has 1s where data is
+    present and 0s for padding positions. Useful to batch-variable
+    sized graphs for operations that require fixed-size tensors.
+    """
     num = len(tensor_list)
     max_len = max([s.shape[0] for s in tensor_list])
     out_dims = (num, max_len, *tensor_list[0].shape[1:])
@@ -33,15 +45,19 @@ def padding_tensors(tensor_list):
 
 
 def inverse_padding_tensors(tensors, masks):
+    """Restore a flattened padded tensor back to a list-style selection.
+
+    Given `tensors` (padded batch) and `masks` produced by
+    `padding_tensors`, this function selects only the real (non-padded)
+    rows and also produces a list mapping each selected row back to
+    its original batch index. Returns (selected_tensor, batch_idx_list).
+    """
     mask_index = torch.sum(masks, dim=-1) / masks.size(-1)
-    # print("mask_index: ", mask_index.size(), mask_index)
-    
+
     _out_mask_select = torch.masked_select(tensors, (masks == 1)).view(-1, tensors.size(-1))
-    # print("_out_mask_select: ", _out_mask_select.size(), _out_mask_select)
-    
+
     batch_index = torch.sum(mask_index, dim=-1)
-    # print("batch_index: ", type(batch_index), batch_index.size(), batch_index)
-    
+
     batch_idx_list = []
     for idx, num in enumerate(batch_index):
         batch_idx_list.extend([idx for _ in range(int(num))])
@@ -49,12 +65,20 @@ def inverse_padding_tensors(tensors, masks):
 
 
 class HierarchicalGraphNeuralNetwork(nn.Module):
+    """
+    The main model class for the hierarchical graph neural network.
+    It consists of two levels of graph neural networks: one for the Control Flow Graph (CFG) and one for the Function Call Graph (FCG).
+    The model also includes pooling layers to aggregate the node features into graph-level features, and a final projection layer to output the prediction.
+    """
+    
     def __init__(self, model_params: ModelParams, external_vocab: Vocab, global_log: logging.Logger):  # device=torch.device('cuda')
         super(HierarchicalGraphNeuralNetwork, self).__init__()
         
+        # Which GNN convolution to use for both CFG and FCG levels
         self.conv = model_params.gnn_type.lower()
         if self.conv not in ['graphsage', 'gcn']:
             raise NotImplementedError
+        # Pooling method used to aggregate node-level features to graph-level
         self.pool = model_params.pool_type.lower()
         if self.pool not in ["global_max_pool", "global_mean_pool"]:
             raise NotImplementedError
@@ -62,8 +86,8 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
         # self.device = device
         self.global_log = global_log
         
-        # Stage 1 of the architecture: encode each sample's Control Flow Graph (CFG).
-        # The CFG encoder stacks graph convolutions followed by pooling into one vector per sample.
+        # Hierarchical 1: build the per-function Control Flow Graph (CFG)
+        # encoder stack. cfg_filter_list describes channel dims per GNN layer.
         print(type(model_params.cfg_filters), model_params.cfg_filters)
         if type(model_params.cfg_filters) == str:
             cfg_filter_list = [int(number_filter) for number_filter in model_params.cfg_filters.split("-")]
@@ -72,6 +96,7 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
         cfg_filter_list.insert(0, model_params.acfg_init_dims)
         self.cfg_filter_length = len(cfg_filter_list)
         
+        # Prepare constructor args for each chosen GNN type per layer
         cfg_graphsage_params = [dict(in_channels=cfg_filter_list[i], out_channels=cfg_filter_list[i + 1], bias=True) for i in range(self.cfg_filter_length - 1)]  # GraphSAGE for cfg
         cfg_gcn_params = [dict(in_channels=cfg_filter_list[i], out_channels=cfg_filter_list[i + 1], cached=False, bias=True) for i in range(self.cfg_filter_length - 1)]  # GCN for cfg
         
@@ -82,15 +107,24 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
         
         cfg_conv = cfg_conv_layer_constructor[self.conv]
         cfg_constructor = cfg_conv['constructor']
+        # Dynamically create attributes `CFG_gnn_1`, `CFG_gnn_2`, ... for layers
         for i in range(self.cfg_filter_length - 1):
             setattr(self, 'CFG_gnn_{}'.format(i + 1), cfg_constructor(**cfg_conv['kwargs'][i]))
         
         # self.dropout = nn.Dropout(p=model_params.dropout_rate).to(self.device)
         self.dropout = nn.Dropout(p=model_params.dropout_rate)
         
-        # Stage 2 of the architecture: combine CFG embeddings with external function-name embeddings,
-        # then process the Function Call Graph (FCG) with another graph encoder.
-        self.external_embedding_layer = nn.Embedding(num_embeddings=external_vocab.max_vocab_size + 2, embedding_dim=cfg_filter_list[-1], padding_idx=external_vocab.pad_idx)
+        # Hierarchical 2: FCG (function-level) encoder. Each function node's
+        # feature is the pooled CFG embedding for that function plus an
+        # optional external-function embedding (for external calls).
+        # External-function IDs are stored with an offset of `max_fcg_nodes` in
+        # `Vocab.__getitem__`, so the embedding table must cover the full shifted
+        # range instead of only the raw vocab size.
+        self.external_embedding_layer = nn.Embedding(
+            num_embeddings=external_vocab.max_fcg_nodes + len(external_vocab),
+            embedding_dim=cfg_filter_list[-1],
+            padding_idx=external_vocab.pad_idx,
+        )
         print(type(model_params.fcg_filters), model_params.fcg_filters)
         if type(model_params.fcg_filters) == str:
             fcg_filter_list = [int(number_filter) for number_filter in model_params.fcg_filters.split("-")]
@@ -112,17 +146,22 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
         for i in range(self.fcg_filter_length - 1):
             setattr(self, 'FCG_gnn_{}'.format(i + 1), fcg_constructor(**fcg_conv['kwargs'][i]))
         
-        # Final classifier head: reduce the graph representation to a single binary malware score.
+        # Final projection head: reduce the function-graph embedding down to
+        # a single logit (binary prediction). We use two intermediate
+        # linear layers to gradually reduce dimensionality.
         self.pj1 = Linear(in_features=fcg_filter_list[-1], out_features=int(fcg_filter_list[-1] / 2))
         self.pj2 = Linear(in_features=int(fcg_filter_list[-1] / 2), out_features=int(fcg_filter_list[-1] / 4))
         self.pj3 = Linear(in_features=int(fcg_filter_list[-1] / 4), out_features=1)
         
+        # Sigmoid for binary output in range (0,1)
         self.last_activation = nn.Sigmoid()
     
     # self.last_activation = nn.Softmax(dim=1)
     # self.last_activation = nn.LogSoftmax(dim=1)
     
     def forward_cfg_gnn(self, local_batch: Batch):
+        # Run the configured GNN stack over nodes of a batched CFG `local_batch`.
+        # `local_batch.x` holds node features and `local_batch.edge_index` the edges.
         in_x, edge_index = local_batch.x, local_batch.edge_index
         for i in range(self.cfg_filter_length - 1):
             out_x = getattr(self, 'CFG_gnn_{}'.format(i + 1))(x=in_x, edge_index=edge_index)
@@ -133,6 +172,8 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
         return local_batch
     
     def aggregate_cfg_batch_pooling(self, local_batch: Batch):
+        # Aggregate node features into per-function graph embeddings.
+        # Returns a tensor shaped [batch_size, feature_dim].
         if self.pool == 'global_max_pool':
             x_pool = global_max_pool(x=local_batch.x, batch=local_batch.batch)
         elif self.pool == 'global_mean_pool':
@@ -142,6 +183,8 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
         return x_pool
     
     def forward_fcg_gnn(self, function_batch: Batch):
+        # Run the configured GNN stack over nodes of a batched FCG `function_batch`.
+        # Each node here corresponds to an entire function (pooled CFG + external emb).
         in_x, edge_index = function_batch.x, function_batch.edge_index
         for i in range(self.fcg_filter_length - 1):
             out_x = getattr(self, 'FCG_gnn_{}'.format(i + 1))(x=in_x, edge_index=edge_index)
@@ -152,6 +195,8 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
         return function_batch
     
     def aggregate_fcg_batch_pooling(self, function_batch: Batch):
+        # Pool across function nodes to obtain a single embedding per sample
+        # (e.g., per binary/sample in the batch) from the FCG-level features.
         if self.pool == 'global_max_pool':
             x_pool = global_max_pool(x=function_batch.x, batch=function_batch.batch)
         elif self.pool == 'global_mean_pool':
@@ -161,6 +206,8 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
         return x_pool
     
     def aggregate_final_skip_pooling(self, x, batch):
+        # Generic helper to pool an arbitrary tensor `x` using the selected
+        # pooling method and `batch` assignment vector.
         if self.pool == 'global_max_pool':
             x_pool = global_max_pool(x=x, batch=batch)
         elif self.pool == 'global_mean_pool':
@@ -171,47 +218,67 @@ class HierarchicalGraphNeuralNetwork(nn.Module):
     
     @staticmethod
     def cosine_attention(mtx1, mtx2):
+        # Compute pairwise cosine attention scores between two batches of
+        # matrices `mtx1` and `mtx2`. Both inputs are expected to have
+        # shape [batch, seq_len, dim]. Returns a [batch, seq_len, seq_len]
+        # matrix of cosine similarities.
         v1_norm = mtx1.norm(p=2, dim=2, keepdim=True)
         v2_norm = mtx2.norm(p=2, dim=2, keepdim=True).permute(0, 2, 1)
         a = torch.bmm(mtx1, mtx2.permute(0, 2, 1))
         d = v1_norm * v2_norm
-        
+
         return div_with_small_value(a, d)
     
     def forward(self, real_local_batch: Batch, real_bt_positions: list, bt_external_names: list, bt_all_function_edges: list, local_device: torch.device):
-        
-        # Encode the CFG for all basic blocks and pool per binary before building the FCG stage.
+        # Top-level forward pass.
+        # 1) Run per-function CFG GNNs and pool to obtain function-level
+        #    embeddings (`x_cfg_pool`). `real_local_batch` contains all
+        #    CFG nodes for the whole batch concatenated together; `real_bt_positions`
+        #    indexes function boundaries.
         rtn_local_batch = self.forward_cfg_gnn(local_batch=real_local_batch)
         x_cfg_pool = self.aggregate_cfg_batch_pooling(local_batch=rtn_local_batch)
         
-        # Reconstruct one function-level graph per binary in the batch.
-        # Each node starts with a pooled CFG embedding and may be augmented with an external-name embedding.
+        # build the Function Call Graph (FCG) Data/Batch datasets
         assert len(real_bt_positions) - 1 == len(bt_external_names), "all should be equal to the batch size ... "
         assert len(real_bt_positions) - 1 == len(bt_all_function_edges), "all should be equal to the batch size ... "
         
+        # 2) Build one small graph per sample where nodes = functions.
+        #    For each sample in the batch, collect its function embeddings
+        #    from `x_cfg_pool`, append an external-function embedding, and
+        #    create a `Data` graph with the provided function-level edges.
         fcg_list = []
         fcg_internal_list = []
         for idx_batch in range(len(real_bt_positions) - 1):
             start_pos, end_pos = real_bt_positions[idx_batch: idx_batch + 2]
-            
+
             idx_x_cfg = x_cfg_pool[start_pos: end_pos]
             fcg_internal_list.append(idx_x_cfg)
-            
+
+            # External function name embedding for this sample (if any)
             idx_x_external = self.external_embedding_layer(torch.tensor([bt_external_names[idx_batch]], dtype=torch.long).to(local_device))
             idx_x_external = idx_x_external.squeeze(dim=0)
-            
+
+            # Node features for FCG = [pooled CFG node features; external emb]
             idx_x_total = torch.cat([idx_x_cfg, idx_x_external], dim=0)
             idx_function_edge = torch.tensor(bt_all_function_edges[idx_batch], dtype=torch.long)
+            if idx_function_edge.numel() > 0:
+                valid_edge_mask = (
+                    (idx_function_edge[0] >= 0)
+                    & (idx_function_edge[1] >= 0)
+                    & (idx_function_edge[0] < idx_x_total.size(0))
+                    & (idx_function_edge[1] < idx_x_total.size(0))
+                )
+                idx_function_edge = idx_function_edge[:, valid_edge_mask]
             idx_graph_data = Data(x=idx_x_total, edge_index=idx_function_edge).to(local_device)
-            
+
             fcg_list.append(idx_graph_data)
         fcg_batch = Batch.from_data_list(fcg_list)
-        # Encode the reconstructed FCGs and pool them into one vector per sample.
+        # Hierarchical 2: Function Call Graph (FCG) embedding and pooling
         rtn_fcg_batch = self.forward_fcg_gnn(function_batch=fcg_batch)  # [batch_size, max_node_size, dim]
         x_fcg_pool = self.aggregate_fcg_batch_pooling(function_batch=rtn_fcg_batch)  # [batch_size, 1, dim] => [batch_size, dim]
         batch_final = x_fcg_pool
         
-        # Binary prediction head with sigmoid output.
+        # step last project to the number_of_numbers (binary)
         bt_final_embed = self.pj3(self.pj2(self.pj1(batch_final)))
         bt_pred = self.last_activation(bt_final_embed)
         return bt_pred

@@ -33,10 +33,10 @@ class MalwareDetectionDataset(Dataset):
         split = len(self.malware_files)
         # split = 100
         if idx < split:
-            idx_data = torch.load(osp.join(self.malware_root, 'malware_{}.pt'.format(idx)))
+            idx_data = torch.load(osp.join(self.malware_root, self.malware_files[idx]))
         else:
             over_fit_idx = idx - split
-            idx_data = torch.load(osp.join(self.benign_root, "benign_{}.pt".format(over_fit_idx)))
+            idx_data = torch.load(osp.join(self.benign_root, self.benign_files[over_fit_idx]))
         return idx_data
 
 

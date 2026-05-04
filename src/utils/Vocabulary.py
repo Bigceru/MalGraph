@@ -5,11 +5,12 @@ from tqdm import tqdm
 
 
 class Vocab:
-    def __init__(self, freq_file: str, max_vocab_size: int, min_freq: int = 1, unk_token: str = '<unk>', pad_token: str = '<pad>', special_tokens: list = None):
+    def __init__(self, freq_file: str, max_vocab_size: int = 10000, min_freq: int = 1, max_fcg_nodes: int = 3000, unk_token: str = '<unk>', pad_token: str = '<pad>', special_tokens: list = None):
         
         self.max_vocab_size = max_vocab_size
         self.min_freq = min_freq
-        
+        self.max_fcg_nodes = max_fcg_nodes
+
         self.unk_token = unk_token
         self.pad_token = pad_token
         self.special_tokens = special_tokens
@@ -28,7 +29,7 @@ class Vocab:
     def __getitem__(self, item: str):
         assert isinstance(item, str)
         if item in self.token_2_index.keys():
-            return self.token_2_index[item]
+            return self.token_2_index[item] + self.max_fcg_nodes  # the index of function name in the vocabulary is added by max_fcg_nodes, to avoid conflict with the node type index in the graph
         else:
             if self.unk_token is not None:
                 return self.token_2_index[self.unk_token]
@@ -80,7 +81,7 @@ class Vocab:
 
 if __name__ == '__main__':
     max_vocab_size = 1000
-    vocab = Vocab(freq_file="./train_external_function_name_vocab.jsonl", max_vocab_size=max_vocab_size)
+    vocab = Vocab(freq_file="../../data/processed_dataset/train_external_function_name_vocab.jsonl", max_vocab_size=max_vocab_size)
     print(len(vocab.token_2_index), vocab.token_2_index)
     print(len(vocab.index_2_token), vocab.index_2_token)
     print(vocab.unk_token, vocab.unk_idx)

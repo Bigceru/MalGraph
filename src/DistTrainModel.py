@@ -27,30 +27,18 @@ from utils.RealBatch import create_real_batch_data
 from utils.Vocabulary import Vocab
 
 
-"""Distributed training entrypoint for the MalGraph hierarchical GNN.
-
-This script wires together Hydra configuration, dataset loading, multi-GPU
-DistributedDataParallel training, periodic validation, and final evaluation.
-The underlying model is a two-stage graph architecture: a Control Flow Graph
-(CFG) encoder followed by a Function Call Graph (FCG) encoder.
-"""
-
-
 class DataLoaderX(DataLoader):
     def __iter__(self):
-        # Prefetch the next batches in a background thread to reduce input stalls.
         return BackgroundGenerator(super().__iter__())
 
 
 def reduce_sum(tensor):
-    # Aggregate a scalar/tensor across all distributed ranks.
     rt = tensor.clone()
     dist.all_reduce(rt, op=dist.ReduceOp.SUM)  # noqa
     return rt
 
 
 def reduce_mean(tensor, nprocs):
-    # Reduce and normalize by the number of processes so every rank sees the same mean.
     rt = tensor.clone()
     dist.all_reduce(rt, op=dist.ReduceOp.SUM)  # noqa
     rt /= nprocs
@@ -58,7 +46,6 @@ def reduce_mean(tensor, nprocs):
 
 
 def all_gather_concat(tensor):
-    # Collect per-rank tensors and concatenate them into the full validation set output.
     tensors_gather = [torch.ones_like(tensor) for _ in range(torch.distributed.get_world_size())]
     dist.all_gather(tensors_gather, tensor, async_op=False)
     output = torch.cat(tensors_gather, dim=0)
@@ -75,7 +62,6 @@ def train_one_epoch(local_rank, train_loader, valid_loader, model, criterion, op
     
     for _idx_bt, _batch in enumerate(tqdm(train_loader, desc="reading _batch from local_rank={}".format(local_rank))):
         model.train()
-        # Each raw batch is split into the graph tensors and metadata expected by the hierarchical model.
         _real_batch, _position, _hash, _external_list, _function_edges, _true_classes = create_real_batch_data(one_batch=_batch)
         if _real_batch is None:
             write_into(result_file, "{}\n_real_batch is None in creating the real batch data of training ... ".format("*-" * 100))
@@ -100,7 +86,6 @@ def train_one_epoch(local_rank, train_loader, valid_loader, model, criterion, op
         until_sum_reduced_loss += reduced_loss.item()
         smooth_avg_reduced_loss_list.append(until_sum_reduced_loss / (_idx_bt + 1))
         
-        # Validate during training so the best checkpoint is chosen by validation AUC, not training loss.
         if _idx_bt != 0 and (_idx_bt % math.ceil(len(train_loader) / 3) == 0 or _idx_bt == int(len(train_loader) - 1)):
             
             val_start_time = datetime.now()
@@ -145,7 +130,6 @@ def validate(local_rank, valid_loader, model, criterion, evaluate_flag, distribu
     
     with torch.no_grad():
         for idx_batch, data in enumerate(tqdm(valid_loader)):
-            # Validation uses the same batch assembly path as training, but without gradients.
             _real_batch, _position, _hash, _external_list, _function_edges, _true_classes = create_real_batch_data(one_batch=data)
             if _real_batch is None:
                 write_into(result_file, "{}\n_real_batch is None in creating the real batch data of validation ... ".format("*-" * 100))
@@ -199,14 +183,20 @@ def validate(local_rank, valid_loader, model, criterion, evaluate_flag, distribu
     return _eval_result
 
 
-def main_train_worker(local_rank: int, nprocs: int, train_params: TrainParams, model_params: ModelParams, optimizer_params: OptimizerParams, global_log: logging.Logger,
-                      log_result_file: str):
-    # One worker per GPU; NCCL handles collective communication across processes.
+def main_train_worker(local_rank: int, nprocs: int, train_params: TrainParams, model_params: ModelParams, optimizer_params: OptimizerParams, global_log: logging.Logger, log_result_file: str):
+    """
+    The main training function for distributed training of the model.
+    It will be called by torch.multiprocessing.spawn() to launch multiple processes for distributed training.
+    Each process will run this function and perform training on a subset of the data.
+    The function will also perform validation after certain batches and save the best model based on the AUC score.
+    The function will also log the training and validation results into a specified log file.
+    """
+
     # dist.init_process_group(backend='nccl', init_method='tcp://127.0.0.1:12345', world_size=nprocs, rank=local_rank)
     dist.init_process_group(backend='nccl', init_method='env://', world_size=nprocs, rank=local_rank)
     torch.cuda.set_device(local_rank)
     
-    # Model architecture: HierarchicalGraphNeuralNetwork = CFG encoder -> FCG encoder -> binary classifier.
+    # model configure
     vocab = Vocab(freq_file=train_params.external_func_vocab_file, max_vocab_size=train_params.max_vocab_size)
     
     if model_params.ablation_models.lower() == "full":
@@ -223,6 +213,7 @@ def main_train_worker(local_rank: int, nprocs: int, train_params: TrainParams, m
     # loss function
     criterion = nn.BCELoss().cuda(local_rank)
     
+    # optimizer
     lr = optimizer_params.lr
     if optimizer_params.optimizer_name.lower() == 'adam':
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -237,11 +228,11 @@ def main_train_worker(local_rank: int, nprocs: int, train_params: TrainParams, m
     train_batch_size = train_params.train_bs
     test_batch_size = train_params.test_bs
     
-    # Training split is sharded across ranks with DistributedSampler.
+    # training dataset & dataloader
     train_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="train")
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
     train_loader = DataLoaderX(dataset=train_dataset, batch_size=train_batch_size, shuffle=False, num_workers=0, pin_memory=True, sampler=train_sampler)
-    # Validation split uses the same sharded pattern to keep validation synchronized.
+    # validation dataset & dataloader
     valid_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="validation")
     valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset)
     valid_loader = DataLoaderX(dataset=valid_dataset, batch_size=test_batch_size, pin_memory=True, sampler=valid_sampler)
@@ -284,7 +275,6 @@ def main_train_worker(local_rank: int, nprocs: int, train_params: TrainParams, m
 # https://hydra.cc/docs/tutorials/basic/your_first_app/defaults#overriding-a-config-group-default
 @hydra.main(config_path="../configs/", config_name="default.yaml")
 def main_app(config: DictConfig):
-    # Hydra centralizes all training, model, and optimizer parameters in the YAML config.
     # set seed for determinism for reproduction
     random.seed(config.Training.seed)
     np.random.seed(config.Training.seed)
@@ -297,12 +287,12 @@ def main_app(config: DictConfig):
     _model_params = ModelParams(gnn_type=config.Model.gnn_type, pool_type=config.Model.pool_type, acfg_init_dims=config.Model.acfg_node_init_dims, cfg_filters=config.Model.cfg_filters, fcg_filters=config.Model.fcg_filters, number_classes=config.Model.number_classes, dropout_rate=config.Model.drapout_rate, ablation_models=config.Model.ablation_models)
     _optim_params = OptimizerParams(optimizer_name=config.Optimizer.name, lr=config.Optimizer.learning_rate, weight_decay=config.Optimizer.weight_decay, learning_anneal=config.Optimizer.learning_anneal)
     
-    # Logging captures the resolved config and the training/validation trace.
+    # logging
     log = logging.getLogger("DistTrainModel.py")
     log.setLevel("DEBUG")
     log.warning("Hydra's Current Working Directory: {}".format(os.getcwd()))
     
-    # Run artifacts are written into the Hydra working directory.
+    # setting for the log directory
     result_file = '{}_{}_{}_ACFG_{}_FCG_{}_Epoch_{}_TrainBS_{}_LR_{}_Time_{}.txt'.format(_model_params.ablation_models, _model_params.gnn_type, _model_params.pool_type,
                                                                                          _model_params.cfg_filters, _model_params.fcg_filters, _train_params.max_epochs,
                                                                                          _train_params.train_bs, _optim_params.lr, datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -316,7 +306,6 @@ def main_app(config: DictConfig):
     params_print_log(_other_params, log_result_file)
     
     if config.Training.only_test_path == 'None':
-        # Multi-GPU training is launched only when there is no pre-trained checkpoint to evaluate.
         os.environ['MASTER_ADDR'] = '127.0.0.1'
         os.environ['MASTER_PORT'] = str(config.Training.dist_port)
         # num_gpus = 1
@@ -329,7 +318,7 @@ def main_app(config: DictConfig):
     else:
         best_model_file = config.Training.only_test_path
     
-    # Rebuild the model once more for evaluation, then load the best checkpoint.
+    # model re-init and loading
     log.info("\n\nstarting to load the model & re-validation & testing from the file of \"{}\" \n".format(best_model_file))
     device = torch.device('cuda')
     train_vocab_path = _train_params.external_func_vocab_file
@@ -345,12 +334,12 @@ def main_app(config: DictConfig):
     
     test_batch_size = config.Training.test_batch_size
     dataset_root_path = _train_params.processed_files_path
-    # Final evaluation uses the validation and test splits without distributed sharding.
+    # validation dataset & dataloader
     valid_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="validation")
     valid_dataloader = DataLoaderX(dataset=valid_dataset, batch_size=test_batch_size, shuffle=False)
     log.info("Total number of all validation samples = {} ".format(len(valid_dataset)))
     
-    # Test split is reported after the checkpoint is fixed.
+    # testing dataset & dataloader
     test_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="test")
     test_dataloader = DataLoaderX(dataset=test_dataset, batch_size=test_batch_size, shuffle=False)
     log.info("Total number of all testing  samples = {} ".format(len(test_dataset)))

@@ -1,5 +1,5 @@
 Data:
-  preprocess_root: "../../Dataset/pe-machine-learning-dataset/pyg_data"
+  preprocess_root: "/home/davide/Malware/Datasets/pe-machine-learning-dataset/pyg_data"
   train_vocab_file: "../train_external_function_name_vocab.jsonl"
   max_vocab_size: 10000         # modify according to the result of 1BuildExternalVocab.py
 Training:
