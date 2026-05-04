@@ -19,3 +19,11 @@ After that, we can save the above hierarchical graph representation into sample.
 
 ### STEP 2: Convert the resulting json file to PyG data object
 However, the above resulting json object can not be directly inputted into our model, we therefore convert it into a PyTorch_Geometric `data` object and provide one example python script of `PreProcess.py` for interested readers.
+
+## Code Execution
+1. Install the requirements that can be found in the `MalGraph` directory.
+2. Move into the `MalGraph/samples` directory and run the following command:
+   NB: If you are running this command for the first time, remember to uncomment the line 968 in `PreProcess.py` to enable the generation of the vocabulary file.
+```bash
+python3 PreProcess.py --input <pe-dataset-directory> --output-dir <output-directory-json> --workers <number-of-threads>
+```

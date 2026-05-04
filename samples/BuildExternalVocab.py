@@ -21,8 +21,11 @@ def iter_json_objects(path: Path) -> Iterator[dict]:
                 yield json.loads(line)
         return
 
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in file: {path}") from e
 
     if isinstance(data, dict):
         yield data
@@ -58,18 +61,20 @@ def count_external_functions(input_path: Path) -> Counter:
 
     freq = Counter()
 
+    # Process each file and count external function names
     for file in tqdm(files, desc="Scanning files"):
         for item in iter_json_objects(file):
             function_names = item.get("function_names", [])
             acfg_list = item.get("acfg_list", [])
 
+            # Validate that acfg_list is not longer than function_names
             local_count = len(acfg_list)
             if local_count > len(function_names):
                 raise ValueError(
                     f"Invalid sample in {file}: len(acfg_list) > len(function_names)"
                 )
 
-            external_names = function_names[local_count:]
+            external_names = function_names[local_count:]     # External functions are expected to be after local functions in the list
             freq.update(external_names)
 
     return freq
@@ -78,6 +83,7 @@ def count_external_functions(input_path: Path) -> Counter:
 def write_vocab_jsonl(freq: Counter, output_file: Path, min_freq: int = 1) -> None:
     output_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Sort by count (descending) and then alphabetically (ascending)
     sorted_items = sorted(
         ((name, count) for name, count in freq.items() if count >= min_freq),
         key=lambda x: (-x[1], x[0]),
@@ -107,6 +113,7 @@ def write_vocab_jsonl(freq: Counter, output_file: Path, min_freq: int = 1) -> No
             key=lambda x: (-x[1], x[0]),
         )
 
+    # Write the sorted vocabulary frequencies to the output JSONL file
     with output_file.open("w", encoding="utf-8") as f:
         for name, count in sorted_items:
             f.write(json.dumps({"f_name": name, "count": count}) + "\n")
@@ -131,6 +138,7 @@ class ExternalVocabBuilder:
         write_vocab_jsonl(freq=freq, output_file=self.output_file, min_freq=self.min_freq)
 
     def run(self) -> Counter:
+        print(f"Building external function vocabulary from: {self.input_path}")
         freq = self.count()
         self.save(freq)
         return freq
