@@ -4,7 +4,7 @@ import json
 import os, sys
 import re
 from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from concurrent.futures import ProcessPoolExecutor
 from BuildExternalVocab import ExternalVocabBuilder
 from Vocabulary import Vocab
@@ -18,6 +18,9 @@ except Exception:
     def tqdm(iterable, *args, **kwargs):
         return iterable
 
+# ########################################################### #
+# Define sets of mnemonics for classification of instructions #
+# ########################################################### #
 
 CALL_MNEMONICS = {
     "call", "callq", "jal", "jalr", "bl", "blx", "icall", "rcall", "ucall"
@@ -72,6 +75,7 @@ KNOWN_LIBRARY_MARKERS = (
 
 
 def sha256_file(path: str) -> str:
+    """Compute the SHA-256 hash of a file in a memory-efficient way by reading it in chunks."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
@@ -80,6 +84,7 @@ def sha256_file(path: str) -> str:
 
 
 def md5_file(path: str) -> str:
+    """Compute the MD5 hash of a file in a memory-efficient way by reading it in chunks."""
     h = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
@@ -88,6 +93,7 @@ def md5_file(path: str) -> str:
 
 
 def norm_name(name: str) -> str:
+    """Normalize function names by stripping common prefixes and library markers, to help unify naming for imported functions across different binaries and r2 versions."""
     if not name:
         return "unknown"
     n = name.strip()
@@ -101,13 +107,13 @@ def norm_name(name: str) -> str:
     return n
 
 
-"""Check if a function metadata likely corresponds to an external/imported function. Return True if it is likely external, False if it is likely local."""
 def is_external_meta(
     r2: Any,
     meta: Dict[str, Any],
     imported_names: Optional[Set[str]] = None,
     imported_offsets: Optional[Set[int]] = None,
 ) -> bool:
+    """Check if a function metadata likely corresponds to an external/imported function. Return True if it is likely external, False if it is likely local."""
     
     # 1. Check common naming patterns and metadata flags
     name = str(meta.get("name", "")).lower()
@@ -160,8 +166,9 @@ def is_external_meta(
     return False
 
 
-"""Build lookups for imported function names and offsets from the list of imports, to be used later for classification and edge resolution."""
 def build_import_lookup(imports: List[Dict[str, Any]]) -> Tuple[Set[str], Set[int]]:
+    """Build lookups for imported function names and offsets from the list of imports, to be used later for classification and edge resolution."""
+
     imported_names: Set[str] = set()
     imported_offsets: Set[int] = set()
 
@@ -197,6 +204,8 @@ def cmd_safe(r2: Any, command: str) -> str:
 
 
 def classify_mnemonic(mnem: str) -> Dict[str, int]:
+    """Classify an instruction's mnemonic into categories such as call, transfer, arithmetic, logic, compare, move, termination, and data declaration. This is used for feature extraction for each block in the ACFG."""
+
     m = mnem.lower()
     call = int(m in CALL_MNEMONICS or m.startswith("call"))
     transfer = int((m in TRANSFER_EXACT or m.startswith(TRANSFER_PREFIXES)) and not call and m not in TERMINATION_MNEMONICS)
@@ -235,8 +244,9 @@ def extract_constants_count(op: Dict[str, Any], strings_addrs: Set[int]) -> int:
     return count
 
 
-"""Given a list of edges in a directed graph and the number of nodes, compute the number of descendants for each node. This is used to capture the influence of a block on the control flow of a function."""
 def descendants_count(edges: List[Tuple[int, int]], num_nodes: int) -> List[int]:
+    """Given a list of edges in a directed graph and the number of nodes, compute the number of descendants for each node. This is used to capture the influence of a block on the control flow of a function."""
+
     # Set recursion limit higher to handle deep graphs
     sys.setrecursionlimit(max(20000, num_nodes + 500))
 
@@ -266,13 +276,14 @@ def descendants_count(edges: List[Tuple[int, int]], num_nodes: int) -> List[int]
     return out
 
 
-"""Resolve the callee of a call instruction to determine the target function name and whether it's external. This is used for edge extraction when building the call graph, especially as a fallback when `agCj` does not provide call graph edges."""
 def resolve_callee(
     r2: Any,
     op: Dict[str, Any],
     all_funcs_by_offset: Dict[int, Dict[str, Any]],
     local_name_by_offset: Dict[int, str],
 ) -> Optional[Tuple[str, bool]]:
+    """Resolve the callee of a call instruction to determine the target function name and whether it's external. This is used for edge extraction when building the call graph, especially as a fallback when `agCj` does not provide call graph edges."""
+
     jump = op.get("jump")
     if isinstance(jump, int):
         if jump in local_name_by_offset:
@@ -291,8 +302,9 @@ def resolve_callee(
     return None
 
 
-"""Collect the call graph edges and node names from r2's `agCj` output, which provides a JSON representation of the call graph. This is used to build the function call graph for the PE file, and serves as the primary source of call graph edges if available."""
 def collect_callgraph(r2: Any) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """Collect the call graph edges and node names from r2's `agCj` output, which provides a JSON representation of the call graph. This is used to build the function call graph for the PE file, and serves as the primary source of call graph edges if available."""
+
     raw = cmdj_safe(r2, "agCj")
     if not isinstance(raw, list):
         return [], []
@@ -345,8 +357,9 @@ def collect_callgraph(r2: Any) -> Tuple[List[str], List[Tuple[str, str]]]:
     return node_names, edges
 
 
-"""Extract a function's PDF and its basic blocks, using `pdfj` for instructions and `agfj`/`afbj` for block structure. Returns a dictionary with keys 'ops' and 'blocks' containing the respective lists of instructions and blocks."""
 def extract_function_pdfj(r2: Any, offset: int) -> Dict[str, Any]:
+    """Extract a function's PDF and its basic blocks, using `pdfj` for instructions and `agfj`/`afbj` for block structure. Returns a dictionary with keys 'ops' and 'blocks' containing the respective lists of instructions and blocks."""
+
     if offset is None:
         return {}
 
@@ -400,96 +413,6 @@ def extract_function_pdfj(r2: Any, offset: int) -> Dict[str, Any]:
     return pdf
 
 
-def op_offset(op: Dict[str, Any]) -> Optional[int]:
-    for key in ("offset", "addr", "address", "ea"):
-        value = op.get(key)
-        if isinstance(value, int):
-            return value
-    return None
-
-
-def block_offset(block: Dict[str, Any]) -> Optional[int]:
-    for key in ("offset", "addr", "address", "ea"):
-        value = block.get(key)
-        if isinstance(value, int):
-            return value
-    return None
-
-
-def normalize_blocks_from_ops(ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    normalized_ops = [op for op in ops if isinstance(op, dict) and op_offset(op) is not None]
-    if not normalized_ops:
-        return []
-
-    normalized_ops.sort(key=lambda op: op_offset(op) or 0)
-    op_offsets = [op_offset(op) or 0 for op in normalized_ops]
-    offset_set = set(op_offsets)
-    leaders = {op_offsets[0]}
-
-    for idx, op in enumerate(normalized_ops):
-        for field in ("jump", "fail"):
-            target = op.get(field)
-            if isinstance(target, int) and target in offset_set:
-                leaders.add(target)
-
-        opcode = str(op.get("opcode", "")).strip().lower()
-        mnem = op.get("mnemonic") or (opcode.split(" ", 1)[0] if opcode else "")
-        cls = classify_mnemonic(str(mnem))
-        if cls["transfer"] or cls["termination"]:
-            if idx + 1 < len(normalized_ops):
-                leaders.add(op_offsets[idx + 1])
-
-    blocks: List[Dict[str, Any]] = []
-    current_ops: List[Dict[str, Any]] = []
-    for op in normalized_ops:
-        off = op_offset(op)
-        if off is None:
-            continue
-        if current_ops and off in leaders:
-            blocks.append({"addr": op_offset(current_ops[0]), "ops": current_ops})
-            current_ops = []
-        current_ops.append(op)
-
-    if current_ops:
-        blocks.append({"addr": op_offset(current_ops[0]), "ops": current_ops})
-
-    return blocks
-
-
-def attach_ops_to_blocks(blocks: List[Dict[str, Any]], ops: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    normalized_blocks = [block for block in blocks if isinstance(block, dict) and block_offset(block) is not None]
-    normalized_ops = [op for op in ops if isinstance(op, dict) and op_offset(op) is not None]
-    if not normalized_blocks or not normalized_ops:
-        return normalized_blocks
-
-    normalized_blocks.sort(key=lambda block: block_offset(block) or 0)
-    normalized_ops.sort(key=lambda op: op_offset(op) or 0)
-
-    for idx, block in enumerate(normalized_blocks):
-        start = block_offset(block) or 0
-        end = None
-        size = block.get("size")
-        if isinstance(size, int) and size > 0:
-            end = start + size
-        elif idx + 1 < len(normalized_blocks):
-            next_start = block_offset(normalized_blocks[idx + 1])
-            if isinstance(next_start, int):
-                end = next_start
-
-        block_ops = []
-        for op in normalized_ops:
-            off = op_offset(op)
-            if off is None or off < start:
-                continue
-            if end is not None and off >= end:
-                continue
-            block_ops.append(op)
-        if block_ops:
-            block["ops"] = block_ops
-
-    return normalized_blocks
-
-
 """Build an ACFG for a function based on its PDF and basic blocks, extracting features for each block and building edges based on jump/fail references. Returns a dictionary containing the ACFG structure and a list of blocks with attached operations."""
 def build_acfg_for_function(
     pdf: Dict[str, Any],
@@ -501,12 +424,6 @@ def build_acfg_for_function(
     # Get blocks and ops from the PDF
     blocks = list(pdf.get("blocks") or [])
     ops = list(pdf.get("ops") or [])
-    # if blocks and ops:
-    #     blocks = attach_ops_to_blocks(blocks, ops)
-    # elif not blocks and ops:
-    #     blocks = normalize_blocks_from_ops(ops)
-    # if not blocks or block_budget <= 0:
-    #     return None, blocks
 
     blocks = sorted(blocks, key=lambda b: int(b.get("addr", 0)))
     if len(blocks) > block_budget:
@@ -617,12 +534,12 @@ def build_acfg_for_function(
     }, blocks
 
 
-"""Main preprocessing function for a single PE file, extracting ACFGs, call graph edges, and function names."""
 def preprocess_pe(
     pe_path: str,
     max_fcg_nodes: int = 3000,
     max_total_blocks: int = 10000,
 ) -> Dict[str, Any]:
+    """Main preprocessing function for a single PE file, extracting ACFGs, call graph edges, and function names."""
     
     # Open the PE file with r2pipe and perform initial analysis
     r2 = r2pipe.open(pe_path, flags=["-2"])
@@ -810,6 +727,7 @@ def process_one_pe_task(task: Tuple[str, int, int]) -> Tuple[str, Optional[Dict[
 
 
 def per_pe_output_path(input_root: str, pe_path: str, output_root: str, single_file_input: bool) -> str:
+    """Determine the output path for a given PE file when writing one JSON file per PE, preserving directory structure relative to the input root if the input is a directory."""
     pe_abs = os.path.abspath(pe_path)
     rel_path = os.path.basename(pe_abs) if single_file_input else os.path.relpath(pe_abs, input_root)
     return os.path.join(output_root, os.path.splitext(rel_path)[0] + ".json")
@@ -879,6 +797,40 @@ def collect_pe_files(path: str, recursive: bool = True) -> List[str]:
             if os.path.isfile(full) and is_probable_pe_file(full):
                 out.append(full)
     return sorted(out)
+
+
+def process_json_to_pyg(json_path, vocabulary):
+    """Process a single JSON file and save as PyG data."""
+    
+    item = json.load(open(json_path, "r", encoding="utf-8"))
+    if not item.get("function_names"):
+        print(f"[WARN] failed to return function indexing for {json_path}. The function names list is empty!")
+        return None
+
+    # Check the parent folder to determine the label
+    # Blacklist -> 0, Whitelist -> 1, otherwise skip PyG conversion for this file
+    try:
+        label = json_path.split(os.sep)[-2].lower()
+        if label == "blacklist":
+            label = 0
+        elif label == "whitelist":
+            label = 1
+        else:
+            print(f"[WARN] unable to determine label for {json_path}, skipping PyG conversion")
+            label = None
+            # return None
+    except IndexError:
+        print(f"[WARN] unable to determine label for {json_path}, skipping PyG conversion")
+        label = None
+        # return None
+
+    torch_data = json_item_to_pyg_data(
+        item=item,
+        label=label,
+        vocab=vocabulary,
+    )
+
+    return torch_data
 
 
 def parse_args() -> argparse.Namespace:
@@ -965,46 +917,10 @@ def main() -> None:
     print(f"Saved {written_count} per-PE JSON files to {out_dir}\n")
 
     # Build the Vocab object - Decomment the following if you want to build the vocabulary
-    # ExternalVocabBuilder(input_path=out_dir, output_file="train_external_function_name_vocab.jsonl").run()
+    ExternalVocabBuilder(input_path=out_dir, output_file="train_external_function_name_vocab.jsonl").run()
 
     # Load the Vocab object
     vocabulary = Vocab(freq_file="train_external_function_name_vocab.jsonl")
-
-    # Fix external function indexing in the JSON files and convert them to PyG objects
-    def process_json_to_pyg(json_path, vocabulary):
-        """Process a single JSON file and save as PyG data."""
-        
-        item = json.load(open(json_path, "r", encoding="utf-8")).get("function_names", [])
-        if not item:
-            print(f"[WARN] failed to fix function indexing for {json_path}. The function names list is empty!")
-            return None
-
-        # Check the parent folder to determine the label
-        # Blacklist -> 0, Whitelist -> 1, otherwise skip PyG conversion for this file
-        label = json_path.split(os.sep)[-2].lower()
-        if label == "blacklist":
-            label = 0
-        elif label == "whitelist":
-            label = 1
-        else:
-            print(f"[WARN] unable to determine label for {json_path}, skipping PyG conversion")
-            return None
-
-        torch_data = json_item_to_pyg_data(
-            item=item,
-            label=label,
-            vocab=vocabulary,
-        )
-
-        # Save the PyG Data object as a .pt file with the same name as the JSON but with .pt extension and in another folder named "pyg_data" keep the same relative structure to the input folder
-        pyg_out_dir = os.path.join(os.path.dirname(out_dir), "pyg_data")
-        os.makedirs(pyg_out_dir, exist_ok=True)
-        relative_path = os.path.relpath(json_path, out_dir)
-        pyg_out_path = os.path.join(pyg_out_dir, os.path.splitext(relative_path)[0] + ".pt")
-        os.makedirs(os.path.dirname(pyg_out_path), exist_ok=True)
-        torch.save(torch_data, pyg_out_path)
-
-        return pyg_out_path
     
     converted_files_count = 0
     for root, _, files in os.walk(out_dir):
@@ -1014,8 +930,17 @@ def main() -> None:
             continue
 
         for json_file in tqdm(json_files, desc=f"Converting JSON to PyG"):
-            pyg_path = process_json_to_pyg(json_file, vocabulary)
-            if pyg_path:
+            torch_data = process_json_to_pyg(json_file, vocabulary)
+
+            # Save the PyG Data object as a .pt file with the same name as the JSON but with .pt extension and in another folder named "pyg_data" keep the same relative structure to the input folder
+            pyg_out_dir = os.path.join(os.path.dirname(out_dir), "pyg_data")
+            os.makedirs(pyg_out_dir, exist_ok=True)
+            relative_path = os.path.relpath(json_file, out_dir)
+            pyg_out_path = os.path.join(pyg_out_dir, os.path.splitext(relative_path)[0] + ".pt")
+            os.makedirs(os.path.dirname(pyg_out_path), exist_ok=True)
+            torch.save(torch_data, pyg_out_path)
+
+            if torch_data is not None:
                 converted_files_count += 1
 
                 
