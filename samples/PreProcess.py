@@ -542,9 +542,9 @@ def preprocess_pe(
     """Main preprocessing function for a single PE file, extracting ACFGs, call graph edges, and function names."""
     
     # Open the PE file with r2pipe and perform initial analysis
-    r2 = r2pipe.open(pe_path, flags=["-2"])
+    r2 = r2pipe.open(pe_path, flags=["-e anal.jmptbl=true", "-e anal.jmptbl.split=true", "-e bin.relocs.apply=true", "-2"])
     try:
-        cmd_safe(r2, "e anal.jmptbl=true")
+        # Set analysis options to improve function and block recognition, especially for complex binaries, and then run the main analysis command `aaa` to analyze all aspects of the binary.
         cmd_safe(r2, "aaa")
 
         # Collect all functions, imports, and strings to build lookups for later use in classification and edge resolution
@@ -799,30 +799,37 @@ def collect_pe_files(path: str, recursive: bool = True) -> List[str]:
     return sorted(out)
 
 
-def process_json_to_pyg(json_path, vocabulary):
-    """Process a single JSON file and save as PyG data."""
-    
-    item = json.load(open(json_path, "r", encoding="utf-8"))
-    if not item.get("function_names"):
-        print(f"[WARN] failed to return function indexing for {json_path}. The function names list is empty!")
-        return None
+def process_json_to_pyg(json_source, vocabulary):
+    """Process a JSON file path or in-memory JSON dict into PyG data."""
 
-    # Check the parent folder to determine the label
-    # Blacklist -> 0, Whitelist -> 1, otherwise skip PyG conversion for this file
-    try:
-        label = json_path.split(os.sep)[-2].lower()
-        if label == "blacklist":
-            label = 0
-        elif label == "whitelist":
-            label = 1
-        else:
-            print(f"[WARN] unable to determine label for {json_path}, skipping PyG conversion")
+    if isinstance(json_source, dict):
+        item = json_source
+        source_name = "in-memory JSON item"
+        label = None
+    else:
+        source_name = json_source
+        item = json.load(open(json_source, "r", encoding="utf-8"))
+
+        # Check the parent folder to determine the label
+        # Blacklist -> 0, Whitelist -> 1, otherwise skip PyG conversion for this file
+        try:
+            label = json_source.split(os.sep)[-2].lower()
+            if label == "blacklist":
+                label = 0
+            elif label == "whitelist":
+                label = 1
+            else:
+                print(f"[WARN] unable to determine label for {json_source}, skipping PyG conversion")
+                label = None
+                # return None
+        except IndexError:
+            print(f"[WARN] unable to determine label for {json_source}, skipping PyG conversion")
             label = None
             # return None
-    except IndexError:
-        print(f"[WARN] unable to determine label for {json_path}, skipping PyG conversion")
-        label = None
-        # return None
+
+    if not item.get("function_names"):
+        print(f"[WARN] failed to return function indexing for {source_name}. The function names list is empty!")
+        return None
 
     torch_data = json_item_to_pyg_data(
         item=item,
