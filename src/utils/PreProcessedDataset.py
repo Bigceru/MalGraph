@@ -11,8 +11,8 @@ class MalwareDetectionDataset(Dataset):
     def __init__(self, root, train_or_test, transform=None, pre_transform=None):
         super(MalwareDetectionDataset, self).__init__(None, transform, pre_transform)
         self.flag = train_or_test.lower()
-        self.malware_root = os.path.join(root, "{}".format(self.flag), "Blacklist")
-        self.benign_root = os.path.join(root, "{}".format(self.flag), "Whitelist")
+        self.malware_root = os.path.join(root, "{}".format(self.flag), "Malware")
+        self.benign_root = os.path.join(root, "{}".format(self.flag), "Benign")
         self.malware_files = os.listdir(self.malware_root)
         self.benign_files = os.listdir(self.benign_root)
     

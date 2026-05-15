@@ -811,12 +811,12 @@ def process_json_to_pyg(json_source, vocabulary):
         item = json.load(open(json_source, "r", encoding="utf-8"))
 
         # Check the parent folder to determine the label
-        # Blacklist -> 0, Whitelist -> 1, otherwise skip PyG conversion for this file
+        # Benign -> 0, Malware -> 1, otherwise skip PyG conversion for this file
         try:
             label = json_source.split(os.sep)[-2].lower()
-            if label == "blacklist":
+            if label == "benign":
                 label = 0
-            elif label == "whitelist":
+            elif label == "malware":
                 label = 1
             else:
                 print(f"[WARN] unable to determine label for {json_source}, skipping PyG conversion")
