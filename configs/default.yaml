@@ -1,5 +1,5 @@
 Data:
-  preprocess_root: "/home/davide/Malware/Datasets/pe-machine-learning-dataset/pyg_data"
+  preprocess_root: "/home/davide/Malware/Datasets/pe-machine-learning-dataset/pyg_data_v2"
   train_vocab_file: "../train_external_function_name_vocab.jsonl"
   max_vocab_size: 10000         # modify according to the result of 1BuildExternalVocab.py
 Training:
@@ -10,8 +10,7 @@ Training:
   train_batch_size: 16
   test_batch_size: 32
   seed: 19920208
-  only_test_path: 'None'
-Model:
+  only_test_path: 'outputs/2026-05-21/12-52-34/LocalRank_0_best_model.pt' # if not None, only test the model at this path:
   ablation_models: "Full"       # "Full"
   gnn_type: "GraphSAGE"         # "GraphSAGE" / "GCN"
   pool_type: "global_max_pool"  # "global_max_pool" / "global_mean_pool"
