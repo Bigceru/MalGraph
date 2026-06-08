@@ -3,8 +3,11 @@ import os.path as osp
 from datetime import datetime
 
 import torch
-from torch_geometric.data import Dataset, DataLoader
-from utils.RealBatch import create_real_batch_data  # noqa
+from torch_geometric.data import Dataset
+from torch_geometric.loader import DataLoader
+from tqdm import tqdm
+
+from .RealBatch import create_real_batch_data  # noqa
 
 
 class MalwareDetectionDataset(Dataset):
@@ -13,8 +16,12 @@ class MalwareDetectionDataset(Dataset):
         self.flag = train_or_test.lower()
         self.malware_root = os.path.join(root, "{}".format(self.flag), "Malware")
         self.benign_root = os.path.join(root, "{}".format(self.flag), "Benign")
-        self.malware_files = os.listdir(self.malware_root)
-        self.benign_files = os.listdir(self.benign_root)
+
+        # Collect valid .pt files for malware and benign samples
+        # self.malware_files = self._collect_valid_pt_files(self.malware_root)
+        # self.benign_files = self._collect_valid_pt_files(self.benign_root)
+        self.malware_files = self._list_files_for_pt(self.malware_root)
+        self.benign_files = self._list_files_for_pt(self.benign_root)
     
     @staticmethod
     def _list_files_for_pt(the_path):
@@ -23,20 +30,42 @@ class MalwareDetectionDataset(Dataset):
             if os.path.splitext(name)[-1] == '.pt':
                 files.append(name)
         return files
+
+    @staticmethod
+    def _collect_valid_pt_files(directory):
+        """Collects valid .pt files from the given directory. Avoids loading files that cannot be loaded as PyTorch tensors."""
+        valid_files = []
+        for name in tqdm(sorted(os.listdir(directory)), desc=f"Checking .pt files in {directory}"):
+            if os.path.splitext(name)[-1] != '.pt':
+                continue
+
+            full_path = osp.join(directory, name)
+            try:
+                item = torch.load(full_path, weights_only=False)
+            except Exception:
+                continue
+
+            if item is None:
+                continue
+
+            valid_files.append(name)
+
+        return valid_files
     
-    def __len__(self):
-        # def len(self):
-        # return 201
+    def len(self):
         return len(self.malware_files) + len(self.benign_files)
+
+    def __len__(self):
+        return self.len()
     
     def get(self, idx):
         split = len(self.malware_files)
         # split = 100
         if idx < split:
-            idx_data = torch.load(osp.join(self.malware_root, self.malware_files[idx]))
+            idx_data = torch.load(osp.join(self.malware_root, self.malware_files[idx]), weights_only=False)
         else:
             over_fit_idx = idx - split
-            idx_data = torch.load(osp.join(self.benign_root, self.benign_files[over_fit_idx]))
+            idx_data = torch.load(osp.join(self.benign_root, self.benign_files[over_fit_idx]), weights_only=False)
         return idx_data
 
 

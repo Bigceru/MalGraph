@@ -1,13 +1,22 @@
-import json
+import ctypes
 import logging
 import os
+import threading
 import zipfile
+import uuid
 from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
-from torch_geometric.data import DataLoader, Batch
 import sys
+
+# import markupsafe
+
+# if not hasattr(markupsafe, "soft_unicode"):
+#     markupsafe.soft_unicode = markupsafe.soft_str
+
+from torch_geometric.data import Batch
 
 from models.HierarchicalGraphModel import HierarchicalGraphNeuralNetwork
 from dataclasses import dataclass
@@ -16,6 +25,60 @@ from utils.RealBatch import create_real_batch_data
 
 sys.path.append(str(Path("../samples")))  # Add the parent directory to the Python path
 from samples.PreProcess import preprocess_pe, process_json_to_pyg
+
+
+FILE_ANALYSIS_TIMEOUT_SECONDS = 300
+FILES_PATH = "../../Datasets/MalwareBazaar/Benign"         # Update this path to your dataset - ../../Datasets/MalwareBazaar/Benign
+VOCAB_PATH = "../train_external_function_name_vocab.jsonl"              # Update this path to your vocabulary file
+MODEL_CHECKPOINT_PATH = "outputs/2026-05-21"                                       # Directory to search for model checkpoints
+
+
+def _preprocess_worker(pe_file, model, vocab, device, threshold=0.5):
+    """Worker function to preprocess a single file with a timeout."""
+    class thread_with_exception(threading.Thread):
+        def __init__(self, name):
+            threading.Thread.__init__(self)
+            self.name = name
+            self._return = None
+                
+        def run(self):
+
+            # target function of the thread class
+            try:
+                self._return = process_single_file(pe_file, model, vocab, device, threshold)
+            finally:
+                pass
+            
+        def get_id(self):
+
+            # returns id of the respective thread
+            if hasattr(self, '_thread_id'):
+                return self._thread_id
+            for id, thread in threading._active.items():
+                if thread is self:
+                    return id
+    
+        def raise_exception(self):
+            thread_id = self.get_id()
+            res = ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, ctypes.py_object(SystemExit))
+            if res > 1:
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(thread_id, 0)
+                print('Exception raise failure')
+
+            return str(pe_file), None  # Return None to indicate timeout or error
+
+    t1 = thread_with_exception('t1')
+    t1.start()
+    t1.join(timeout=FILE_ANALYSIS_TIMEOUT_SECONDS)
+
+    if t1.is_alive():
+        print(f"File {str(pe_file)} is taking too long to process. Terminating.")
+        t1.raise_exception()
+        t1.join(timeout=0)
+
+        return (str(pe_file), None)
+    
+    return t1._return
 
 
 @dataclass
@@ -145,9 +208,7 @@ def load_model_from_path(model_path, log_path=None, global_log=None, device=None
     train_params, model_params = _load_params_from_log(log_path)
 
     # Initialize the vocabulary
-    vocab_path = "../train_external_function_name_vocab.jsonl"
-    global vocab
-    vocab = Vocab(freq_file=vocab_path, max_vocab_size=train_params.max_vocab_size)
+    vocab = Vocab(freq_file=VOCAB_PATH, max_vocab_size=train_params.max_vocab_size)
 
     # Initialize the global logger
     if global_log is None:
@@ -169,7 +230,7 @@ def load_model_from_path(model_path, log_path=None, global_log=None, device=None
     model.to(device)
     model.eval()
 
-    return model
+    return model, vocab
 
 
 def _is_valid_checkpoint(model_path):
@@ -231,7 +292,7 @@ def load_files(input_path: str) -> list:
     files = []
     # Cycle through all files in the directory and subdirectories
     for path in path.glob("**/*"):
-        if path.is_file():
+        if path.is_file(): # and path.suffix.lower() in {".exe", ".dll", ".sys", ".drv", ".ocx", ".scr", ".cpl", ".efi"}:  # Keep only "common" PE file extensions
             files.append(path)
     if files:
         return files
@@ -250,7 +311,7 @@ def extract_statistics(predictions: dict) -> dict:
         if extension in extension_counts:
             extension_counts[extension][predicted_class] += 1
         else:
-            extension_counts[extension] = {"Malware": 0, "Benign": 0}   # Initialize the count for both classes
+            extension_counts[extension] = {"Malware": 0, "Benign": 0, "Timeout": 0}   # Initialize the count for both classes
             extension_counts[extension][predicted_class] = 1
 
     return extension_counts
@@ -259,80 +320,201 @@ def extract_statistics(predictions: dict) -> dict:
 def print_statistics(statistics: dict) -> None:
     print("\nStatistics of Predictions by File Extension:")
     for extension, counts in statistics.items():
-        total = counts["Benign"] + counts["Malware"]
+        total = counts["Benign"] + counts["Malware"] + counts["Timeout"]
         print(f"Extension: {extension} - Total: {total}")
         print(f"  Benign: {counts['Benign']}\t- {(counts['Benign'] / total * 100):.2f}%")
-        print(f"  Malware: {counts['Malware']}\t- {(counts['Malware'] / total * 100):.2f}%\n")
+        print(f"  Malware: {counts['Malware']}\t- {(counts['Malware'] / total * 100):.2f}%")
+        print(f"  Timeout: {counts['Timeout']}\t- {(counts['Timeout'] / total * 100):.2f}%\n")
+
+
+def process_single_file(pe_file, model, vocab, device, threshold=0.5):
+    """
+    Process a single PE file in a separate thread.
+    
+    Args:
+        pe_file: Path to the PE file
+        model: The loaded model (thread-safe in eval mode)
+        vocab: The vocabulary object
+        device: The torch device
+    
+    Returns:
+        Tuple of (file_path_str, predicted_class_str) or (file_path_str, error_msg) on failure
+    """
+    thread_id = str(uuid.uuid4())[:8]
+
+    try:
+        print(f"[Thread-{thread_id}] Processing file: {pe_file}")
+
+        json_item = preprocess_pe(str(pe_file))
+
+        # If preprocess_pe returns None
+        if json_item is None:
+            print(f"[Thread-{thread_id}] No data returned from preprocess_pe for {pe_file}. Marking as timeout.")
+            return (str(pe_file), None)
+
+        # Convert JSON to PyG format directly in memory and batch it without temp files.
+        pyg_file = process_json_to_pyg(json_item, vocabulary=vocab)
+
+        if pyg_file is None:
+            print(f"[Thread-{thread_id}] Skipping file {pe_file} due to preprocessing issues.")
+            return (str(pe_file), None)
+
+        batch = Batch.from_data_list([pyg_file])
+        
+        # Create real batch format
+        real_batch, positions, hashes, external_names, fcg_edges, labels = create_real_batch_data(batch)
+        
+        if real_batch is None:
+            print(f"[Thread-{thread_id}] Skipping file {pe_file} due to preprocessing issues.")
+            return (str(pe_file), None)
+        
+        # Make prediction
+        with torch.no_grad():
+            prediction = model(
+                real_local_batch=real_batch.to(device),
+                real_bt_positions=positions,
+                bt_external_names=external_names,
+                bt_all_function_edges=fcg_edges,
+                local_device=device
+            )
+            
+            # Get predicted probability (model outputs value between 0 and 1)
+            prediction = prediction.squeeze(-1)
+
+            # If prediction is a tensor with a single value, convert to scalar
+            if prediction.numel() == 1:
+                prob = float(prediction.item())
+            else:
+                # If multiple values, take the first (single-sample batch expected)
+                prob = float(prediction.view(-1)[0].item())
+
+            # Threshold at 0.5 to obtain class 0 or 1
+            predicted_class_idx = 1 if prob >= threshold else 0
+            predicted_label = {0: "Benign", 1: "Malware"}.get(predicted_class_idx)
+            print(f"{pe_file.name}: {predicted_label} / {predicted_class_idx} - Prediction: {prediction.cpu().numpy()}")
+            
+            return (str(pe_file), predicted_label)
+
+    except Exception as e:
+        print(f"[Thread-{thread_id}] Error processing {pe_file}: {str(e)}")
+        return (str(pe_file), None)
 
 
 # Example usage:
 if __name__ == "__main__":
     try:
         # Search recursively through outputs/ for valid checkpoints
-        model_path = find_best_model(local_rank=0, search_dir="outputs")
-        model = load_model_from_path(model_path)
+        model_path = find_best_model(local_rank=0, search_dir=MODEL_CHECKPOINT_PATH)
+        model, vocab = load_model_from_path(model_path)
         print("Model loaded successfully via the saved checkpoint and training log.")
 
         # Test the model on the custom dataset
-        pe_files = load_files("../../Datasets/MalwareBazaar/Malware")
+        pe_files = load_files(FILES_PATH)
         print(f"Loaded {len(pe_files)} PE files for testing.")
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
+
+        # Process files in parallel using multithreading
         predictions = {}
-        for pe_file in pe_files:
-            print(f"Processing file: {pe_file}")
-            # Here you would add code to preprocess the PE file, create the appropriate input tensors,
-            # and then pass them through the model to get predictions.
-            # For example:
-            json_item = preprocess_pe(str(pe_file))
+        num_workers = min(4, len(pe_files))  # Use up to 4 threads, or fewer if fewer files
+        print(f"Starting multithreaded processing with {num_workers} workers...\n")
 
-            # Temp save the JSON data
-            with open("temp_data.json", "w", encoding="utf-8") as f:
-                json.dump(json_item, f, ensure_ascii=False)
+        start_time = datetime.now()
 
-            # Convert the JSON data to a PyG Data object and then to a tensor for model input
-            pyg_file = process_json_to_pyg("temp_data.json", vocabulary=vocab)
+        # ########################## #
+        # Single threaded processing #
+        # ########################## #
 
-            # Temp save the PyG Data object
-            torch.save(pyg_file, "temp_data.pt")
+        # for pe_file in pe_files:
+        #     item = preprocess_pe(str(pe_file))
+        #     pyg_file = process_json_to_pyg(item, vocabulary=vocab)
 
-            input_tensor = torch.load("temp_data.pt")  # Load the PyG Data object as a tensor
+        #     if pyg_file is None:
+        #         print(f"Skipping file {pe_file} due to preprocessing issues.")
+        #         continue
 
-            batch = Batch.from_data_list([input_tensor])
+        #     batch = Batch.from_data_list([pyg_file])
+            
+        #     # Create real batch format
+        #     real_batch, positions, hashes, external_names, fcg_edges, labels = create_real_batch_data(batch)
+            
+        #     if real_batch is None:
+        #         print(f"Skipping file {pe_file} due to preprocessing issues.")
+        #         continue
+            
+        #     # Make prediction
+        #     with torch.no_grad():
+        #         prediction = model(
+        #             real_local_batch=real_batch.to(device),
+        #             real_bt_positions=positions,
+        #             bt_external_names=external_names,
+        #             bt_all_function_edges=fcg_edges,
+        #             local_device=device
+        #         )
 
-            model.eval()    # Set model to evaluation mode
+        #         # Get predicted probability (model outputs value between 0 and 1)
+        #         prediction = prediction.squeeze(-1)
 
-            # Convert to real batch format
-            real_batch, positions, hashes, external_names, fcg_edges, labels = create_real_batch_data(batch)
+        #         # If prediction is a tensor with a single value, convert to scalar
+        #         if prediction.numel() == 1:
+        #             prob = float(prediction.item())
+        #         else:
+        #             # If multiple values, take the first (single-sample batch expected)
+        #             prob = float(prediction.view(-1)[0].item())
 
-            if real_batch is None:
-                print(f"Skipping file {pe_file} due to preprocessing issues.")
-                continue
+        #         # Threshold at 0.5 to obtain class 0 or 1
+        #         threshold = 0.5
+        #         predicted_class_idx = 1 if prob >= threshold else 0
+        #         predicted_class = {0: "Benign", 1: "Malware"}.get(predicted_class_idx)
+        #         print(f"{pe_file.name}: {predicted_class} / {predicted_class_idx} - Prediction: {prediction.cpu().numpy()}")
 
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        #     if predicted_class is not None:
+        #         predictions[str(pe_file)] = predicted_class
 
-            # Make predictions with the model
-            with torch.no_grad():
-                prediction = model(
-                    real_local_batch=real_batch.to(device),
-                    real_bt_positions=positions,
-                    bt_external_names=external_names,
-                    bt_all_function_edges=fcg_edges,
-                    local_device=device
-                )
+        #     print(f"[Progress] Completed {len(predictions)}/{len(pe_files)} files")
 
-                predicted_class = torch.argmax(prediction, dim=1).item()
-                predictions[str(pe_file)] = "Malware" if predicted_class == 0 else "Benign"
-                print(f"Predicted class for {pe_file}: {predicted_class}")
+        # ######################## #
+        # Multithreaded processing #
+        # ######################## #
+        
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Submit all tasks
+            future_to_file = {
+                executor.submit(_preprocess_worker, pe_file, model, vocab, device, 0.5): pe_file
+                for pe_file in pe_files
+            }
+
+        # Check if there are no tasks submitted (e.g., empty file list)
+        if not future_to_file:
+            print("No files to process.")
+            exit(0)
+            
+        # Process completed tasks as they finish
+        completed = 0
+        not_processed = 0
+        for future in as_completed(future_to_file):
+            completed += 1
+            try:
+                file_path, predicted_class = future.result()
+
+                # If predicted_class is None, it means there was an error or the file was skipped during processing
+                if predicted_class is not None:
+                    predictions[file_path] = predicted_class
+                else:
+                    not_processed += 1
+                print(f"[Progress] Completed {completed}/{len(pe_files)} files")
+            except Exception as e:
+                print(f"[Error] Task failed: {e}")
+
+        elapsed_time = datetime.now() - start_time
+        print(f"\nMultithreaded processing completed in {elapsed_time.total_seconds():.2f} seconds")
+        print(f"Successfully processed {len(predictions)} files out of {len(pe_files)}")
+        print(f"Files not processed: {not_processed}")
 
         # Extract and print statistics
-        stats = extract_statistics(predictions)
+        stats = extract_statistics({Path(k): v for k, v in predictions.items()})
         print_statistics(stats)
-
-        # Clean up temporary files
-        if os.path.exists("temp_data.json"):
-            os.remove("temp_data.json")
-        if os.path.exists("temp_data.pt"):
-            os.remove("temp_data.pt")
 
     except FileNotFoundError as exc:
         print(f"Error: {exc}")

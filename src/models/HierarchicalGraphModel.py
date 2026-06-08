@@ -6,12 +6,15 @@ from torch import nn
 from torch.nn import Linear
 from torch.nn import functional as pt_f
 from torch_geometric.data import Batch, Data
-from torch_geometric.nn.conv import GCNConv, SAGEConv
-from torch_geometric.nn.glob import global_max_pool, global_mean_pool
+from torch_geometric.nn import GCNConv, SAGEConv, global_max_pool, global_mean_pool
 
-sys.path.append("..")
-from utils.ParameterClasses import ModelParams  # noqa
-from utils.Vocabulary import Vocab  # noqa
+try:
+    from ..utils.ParameterClasses import ModelParams  # noqa
+    from ..utils.Vocabulary import Vocab  # noqa
+except ImportError:
+    sys.path.append("..")
+    from utils.ParameterClasses import ModelParams  # noqa
+    from utils.Vocabulary import Vocab  # noqa
 
 
 def div_with_small_value(n, d, eps=1e-8):

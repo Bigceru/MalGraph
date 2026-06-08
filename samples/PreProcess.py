@@ -6,8 +6,12 @@ import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Set, Tuple
 from concurrent.futures import ProcessPoolExecutor
-from BuildExternalVocab import ExternalVocabBuilder
-from Vocabulary import Vocab
+try:
+    from .BuildExternalVocab import ExternalVocabBuilder
+    from .Vocabulary import Vocab
+except ImportError:
+    from BuildExternalVocab import ExternalVocabBuilder
+    from Vocabulary import Vocab
 import torch
 from torch_geometric.data import Data
 import r2pipe
@@ -924,7 +928,7 @@ def main() -> None:
     print(f"Saved {written_count} per-PE JSON files to {out_dir}\n")
 
     # Build the Vocab object - Decomment the following if you want to build the vocabulary
-    ExternalVocabBuilder(input_path=out_dir, output_file="train_external_function_name_vocab.jsonl").run()
+    # ExternalVocabBuilder(input_path=out_dir, output_file="train_external_function_name_vocab.jsonl").run()
 
     # Load the Vocab object
     vocabulary = Vocab(freq_file="train_external_function_name_vocab.jsonl")
@@ -939,19 +943,22 @@ def main() -> None:
         for json_file in tqdm(json_files, desc=f"Converting JSON to PyG"):
             torch_data = process_json_to_pyg(json_file, vocabulary)
 
+            if torch_data is None:
+                print(f"[WARN] skipping PyG conversion for {json_file} due to missing function names")
+                continue
+
             # Save the PyG Data object as a .pt file with the same name as the JSON but with .pt extension and in another folder named "pyg_data" keep the same relative structure to the input folder
-            pyg_out_dir = os.path.join(os.path.dirname(out_dir), "pyg_data")
+            pyg_out_dir = os.path.join(os.path.dirname(out_dir), "pyg_data_v2")
             os.makedirs(pyg_out_dir, exist_ok=True)
             relative_path = os.path.relpath(json_file, out_dir)
             pyg_out_path = os.path.join(pyg_out_dir, os.path.splitext(relative_path)[0] + ".pt")
             os.makedirs(os.path.dirname(pyg_out_path), exist_ok=True)
             torch.save(torch_data, pyg_out_path)
 
-            if torch_data is not None:
-                converted_files_count += 1
+            converted_files_count += 1
 
                 
-    print(f"Converted {converted_files_count} JSON files to PyG Data objects in {os.path.join(os.path.dirname(out_dir), 'pyg_data')}\n")
+    print(f"Converted {converted_files_count} JSON files to PyG Data objects in {os.path.join(os.path.dirname(out_dir), 'pyg_data_v2')}\n")
 
 if __name__ == "__main__":
     main()

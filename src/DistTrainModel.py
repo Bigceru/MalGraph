@@ -14,17 +14,25 @@ import torch.utils.data.distributed
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 from prefetch_generator import BackgroundGenerator
-from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.metrics import roc_auc_score, roc_curve, accuracy_score, balanced_accuracy_score, precision_score, recall_score, f1_score
 from torch import nn
-from torch_geometric.data import DataLoader
+from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
-from models.HierarchicalGraphModel import HierarchicalGraphNeuralNetwork
-from utils.FunctionHelpers import write_into, params_print_log, find_threshold_with_fixed_fpr
-from utils.ParameterClasses import ModelParams, TrainParams, OptimizerParams, OneEpochResult
-from utils.PreProcessedDataset import MalwareDetectionDataset
-from utils.RealBatch import create_real_batch_data
-from utils.Vocabulary import Vocab
+try:
+    from .models.HierarchicalGraphModel import HierarchicalGraphNeuralNetwork
+    from .utils.FunctionHelpers import write_into, params_print_log, find_threshold_with_fixed_fpr, find_threshold_with_fixed_fnr
+    from .utils.ParameterClasses import ModelParams, TrainParams, OptimizerParams, OneEpochResult
+    from .utils.PreProcessedDataset import MalwareDetectionDataset
+    from .utils.RealBatch import create_real_batch_data
+    from .utils.Vocabulary import Vocab
+except ImportError:
+    from models.HierarchicalGraphModel import HierarchicalGraphNeuralNetwork
+    from utils.FunctionHelpers import write_into, params_print_log, find_threshold_with_fixed_fpr, find_threshold_with_fixed_fnr
+    from utils.ParameterClasses import ModelParams, TrainParams, OptimizerParams, OneEpochResult
+    from utils.PreProcessedDataset import MalwareDetectionDataset
+    from utils.RealBatch import create_real_batch_data
+    from utils.Vocabulary import Vocab
 
 
 class DataLoaderX(DataLoader):
@@ -34,27 +42,41 @@ class DataLoaderX(DataLoader):
 
 def reduce_sum(tensor):
     rt = tensor.clone()
+    if not dist.is_available() or not dist.is_initialized():
+        return rt
     dist.all_reduce(rt, op=dist.ReduceOp.SUM)  # noqa
     return rt
 
 
 def reduce_mean(tensor, nprocs):
     rt = tensor.clone()
+    if not dist.is_available() or not dist.is_initialized():
+        return rt
     dist.all_reduce(rt, op=dist.ReduceOp.SUM)  # noqa
     rt /= nprocs
     return rt
 
 
+def _unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
+
+
 def all_gather_concat(tensor):
+    if not dist.is_available() or not dist.is_initialized():
+        return tensor
     tensors_gather = [torch.ones_like(tensor) for _ in range(torch.distributed.get_world_size())]
     dist.all_gather(tensors_gather, tensor, async_op=False)
     output = torch.cat(tensors_gather, dim=0)
     return output
 
 
-def train_one_epoch(local_rank, train_loader, valid_loader, model, criterion, optimizer, nprocs, idx_epoch, best_auc, best_model_file, original_valid_length, result_file):
+def distributed_barrier():
+    if dist.is_available() and dist.is_initialized():
+        torch.distributed.barrier()
+
+
+def train_one_epoch(local_rank, train_loader, valid_loader, model, criterion, optimizer, nprocs, idx_epoch, best_auc, best_model_file, original_valid_length, result_file, local_device, distributed):
     model.train()
-    local_device = torch.device("cuda", local_rank)
     write_into(file_name_path=result_file, log_str="The local device = {} among {} nprocs in the {}-th epoch.".format(local_device, nprocs, idx_epoch))
     
     until_sum_reduced_loss = 0.0
@@ -68,15 +90,16 @@ def train_one_epoch(local_rank, train_loader, valid_loader, model, criterion, op
             continue
         
         _real_batch = _real_batch.to(local_device)
-        _position = torch.tensor(_position, dtype=torch.long).cuda(local_rank, non_blocking=True)
-        _true_classes = _true_classes.float().cuda(local_rank, non_blocking=True)
+        _position = torch.tensor(_position, dtype=torch.long, device=local_device)
+        _true_classes = _true_classes.float().to(local_device)
         
         train_batch_pred = model(real_local_batch=_real_batch, real_bt_positions=_position, bt_external_names=_external_list, bt_all_function_edges=_function_edges, local_device=local_device)
         train_batch_pred = train_batch_pred.squeeze()
         
         loss = criterion(train_batch_pred, _true_classes)
         
-        torch.distributed.barrier()
+        if distributed:
+            torch.distributed.barrier()
         
         optimizer.zero_grad()
         loss.backward()
@@ -93,7 +116,7 @@ def train_one_epoch(local_rank, train_loader, valid_loader, model, criterion, op
                 write_into(result_file, "\nIn {}-th epoch, {}-th batch, we start to validate ... ".format(idx_epoch, _idx_bt))
             
             _eval_flag = "Valid_In_Train_Epoch_{}_Batch_{}".format(idx_epoch, _idx_bt)
-            valid_result = validate(local_rank=local_rank, valid_loader=valid_loader, model=model, criterion=criterion, evaluate_flag=_eval_flag, distributed=True, nprocs=nprocs,
+            valid_result = validate(local_rank=local_rank, valid_loader=valid_loader, model=model, criterion=criterion, evaluate_flag=_eval_flag, distributed=distributed, nprocs=nprocs,
                                     original_valid_length=original_valid_length, result_file=result_file, details=False)
             
             if best_auc < valid_result.ROC_AUC_Score:
@@ -103,7 +126,7 @@ def train_one_epoch(local_rank, train_loader, valid_loader, model, criterion, op
                                                                                                                                                      valid_result.ROC_AUC_Score,
                                                                                                                                                      best_model_file)
                 best_auc = valid_result.ROC_AUC_Score
-                torch.save(model.module.state_dict(), best_model_file)
+                torch.save(_unwrap_model(model).state_dict(), best_model_file)
             else:
                 _info = "[AUC NOT Increased!] AUC decreased from {:.5f} to {:.5f}!".format(best_auc, valid_result.ROC_AUC_Score)
             
@@ -115,12 +138,13 @@ def train_one_epoch(local_rank, train_loader, valid_loader, model, criterion, op
     return smooth_avg_reduced_loss_list, best_auc
 
 
-def validate(local_rank, valid_loader, model, criterion, evaluate_flag, distributed, nprocs, original_valid_length, result_file, details):
+def validate(local_rank, valid_loader, model, criterion, evaluate_flag, distributed, nprocs, original_valid_length, result_file, details, local_device=None):
     model.eval()
-    if distributed:
-        local_device = torch.device("cuda", local_rank)
-    else:
-        local_device = torch.device("cuda")
+    if local_device is None:
+        if distributed:
+            local_device = torch.device("cuda", local_rank)
+        else:
+            local_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     sum_loss = torch.tensor(0.0, dtype=torch.float, device=local_device)
     n_samples = torch.tensor(0, dtype=torch.int, device=local_device)
@@ -135,8 +159,8 @@ def validate(local_rank, valid_loader, model, criterion, evaluate_flag, distribu
                 write_into(result_file, "{}\n_real_batch is None in creating the real batch data of validation ... ".format("*-" * 100))
                 continue
             _real_batch = _real_batch.to(local_device)
-            _position = torch.tensor(_position, dtype=torch.long).cuda(local_rank, non_blocking=True)
-            _true_classes = _true_classes.float().cuda(local_rank, non_blocking=True)
+            _position = torch.tensor(_position, dtype=torch.long, device=local_device)
+            _true_classes = _true_classes.float().to(local_device)
             
             batch_pred = model(real_local_batch=_real_batch, real_bt_positions=_position, bt_external_names=_external_list, bt_all_function_edges=_function_edges, local_device=local_device)
             batch_pred = batch_pred.squeeze(-1)
@@ -153,7 +177,7 @@ def validate(local_rank, valid_loader, model, criterion, evaluate_flag, distribu
     all_positive_probs = torch.cat(all_positive_probs, dim=0)
     
     if distributed:
-        torch.distributed.barrier()
+        distributed_barrier()
         reduced_n_samples = reduce_sum(n_samples)
         reduced_avg_loss = reduce_mean(avg_loss, nprocs)
         gather_true_classes = all_gather_concat(all_true_classes).detach().cpu().numpy()
@@ -175,11 +199,20 @@ def validate(local_rank, valid_loader, model, criterion, evaluate_flag, distribu
     if details is True:
         _100_info = find_threshold_with_fixed_fpr(y_true=gather_true_classes, y_pred=gather_positive_prods, fpr_target=0.01)
         _1000_info = find_threshold_with_fixed_fpr(y_true=gather_true_classes, y_pred=gather_positive_prods, fpr_target=0.001)
+        _100_info_fnr = find_threshold_with_fixed_fnr(y_true=gather_true_classes, y_pred=gather_positive_prods, fnr_target=0.01)
+        _1000_info_fnr = find_threshold_with_fixed_fnr(y_true=gather_true_classes, y_pred=gather_positive_prods, fnr_target=0.001)
     else:
-        _100_info, _1000_info = "None", "None"
-    
-    _eval_result = OneEpochResult(Epoch_Flag=evaluate_flag, Number_Samples=reduced_n_samples, Avg_Loss=reduced_avg_loss, Info_100=_100_info, Info_1000=_1000_info,
-                                  ROC_AUC_Score=_roc_auc_score, Thresholds=_thresholds, TPRs=_tpr, FPRs=_fpr)
+        _100_info, _1000_info, _100_info_fnr, _1000_info_fnr = "None", "None", "None", "None"
+
+    # Compute the following metrics: accuracy, balanced accuracy, precision, recall, F1-score with the threshold of 0.5
+    _accuracy = accuracy_score(y_true=gather_true_classes, y_pred=(gather_positive_prods > 0.5).astype(int))
+    _balanced_accuracy = balanced_accuracy_score(y_true=gather_true_classes, y_pred=(gather_positive_prods > 0.5).astype(int))
+    _precision = precision_score(y_true=gather_true_classes, y_pred=(gather_positive_prods > 0.5).astype(int))
+    _recall = recall_score(y_true=gather_true_classes, y_pred=(gather_positive_prods > 0.5).astype(int))
+    _f1_score = f1_score(y_true=gather_true_classes, y_pred=(gather_positive_prods > 0.5).astype(int))
+
+    _eval_result = OneEpochResult(Epoch_Flag=evaluate_flag, Number_Samples=reduced_n_samples, Avg_Loss=reduced_avg_loss, Accuracy=_accuracy, Balanced_Accuracy=_balanced_accuracy, Precision=_precision, Recall=_recall, F1_Score=_f1_score,
+                                  Info_100_fpr=_100_info, Info_1000_fpr=_1000_info, Info_100_fnr=_100_info_fnr, Info_1000_fnr=_1000_info_fnr, ROC_AUC_Score=_roc_auc_score, Thresholds=_thresholds, TPRs=_tpr, FPRs=_fpr)
     return _eval_result
 
 
@@ -192,9 +225,14 @@ def main_train_worker(local_rank: int, nprocs: int, train_params: TrainParams, m
     The function will also log the training and validation results into a specified log file.
     """
 
-    # dist.init_process_group(backend='nccl', init_method='tcp://127.0.0.1:12345', world_size=nprocs, rank=local_rank)
-    dist.init_process_group(backend='nccl', init_method='env://', world_size=nprocs, rank=local_rank)
-    torch.cuda.set_device(local_rank)
+    use_cuda = torch.cuda.is_available()
+    use_distributed = use_cuda and nprocs > 1
+    local_device = torch.device("cuda", local_rank) if use_cuda else torch.device("cpu")
+
+    if use_distributed:
+        # Specify device_id to avoid device-context warning in newer PyTorch versions
+        dist.init_process_group(backend='nccl', init_method='env://', world_size=nprocs, rank=local_rank, device_id=local_rank)
+        torch.cuda.set_device(local_rank)
     
     # model configure
     vocab = Vocab(freq_file=train_params.external_func_vocab_file, max_vocab_size=train_params.max_vocab_size)
@@ -204,14 +242,15 @@ def main_train_worker(local_rank: int, nprocs: int, train_params: TrainParams, m
     else:
         raise NotImplementedError
     
-    model.cuda(local_rank)
-    model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
+    model = model.to(local_device)
+    if use_distributed:
+        model = nn.parallel.DistributedDataParallel(model, device_ids=[local_rank])
     
     if local_rank == 0:
         write_into(file_name_path=log_result_file, log_str=model.__str__())
     
     # loss function
-    criterion = nn.BCELoss().cuda(local_rank)
+    criterion = nn.BCELoss().to(local_device)
     
     # optimizer
     lr = optimizer_params.lr
@@ -230,16 +269,16 @@ def main_train_worker(local_rank: int, nprocs: int, train_params: TrainParams, m
     
     # training dataset & dataloader
     train_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="train")
-    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    train_loader = DataLoaderX(dataset=train_dataset, batch_size=train_batch_size, shuffle=False, num_workers=0, pin_memory=True, sampler=train_sampler)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset) if use_distributed else None
+    train_loader = DataLoaderX(dataset=train_dataset, batch_size=train_batch_size, shuffle=not use_distributed, num_workers=0, pin_memory=use_cuda, sampler=train_sampler)
     # validation dataset & dataloader
     valid_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="validation")
-    valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset)
-    valid_loader = DataLoaderX(dataset=valid_dataset, batch_size=test_batch_size, pin_memory=True, sampler=valid_sampler)
+    valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset) if use_distributed else None
+    valid_loader = DataLoaderX(dataset=valid_dataset, batch_size=test_batch_size, pin_memory=use_cuda, sampler=valid_sampler, shuffle=False)
     
     if local_rank == 0:
-        write_into(file_name_path=log_result_file, log_str="Training dataset={}, sampler={}, loader={}".format(len(train_dataset), len(train_sampler), len(train_loader)))
-        write_into(file_name_path=log_result_file, log_str="Validation dataset={}, sampler={}, loader={}".format(len(valid_dataset), len(valid_sampler), len(valid_loader)))
+        write_into(file_name_path=log_result_file, log_str="Training dataset={}, sampler={}, loader={}".format(len(train_dataset), len(train_sampler) if train_sampler is not None else "None", len(train_loader)))
+        write_into(file_name_path=log_result_file, log_str="Validation dataset={}, sampler={}, loader={}".format(len(valid_dataset), len(valid_sampler) if valid_sampler is not None else "None", len(valid_loader)))
     
     best_auc = 0.0
     ori_valid_length = len(valid_dataset)
@@ -247,8 +286,9 @@ def main_train_worker(local_rank: int, nprocs: int, train_params: TrainParams, m
     
     all_batch_avg_smooth_loss_list = []
     for epoch in range(max_epochs):
-        train_sampler.set_epoch(epoch)
-        valid_sampler.set_epoch(epoch)
+        if use_distributed:
+            train_sampler.set_epoch(epoch)
+            valid_sampler.set_epoch(epoch)
         
         # train for one epoch
         time_start = datetime.now()
@@ -257,7 +297,7 @@ def main_train_worker(local_rank: int, nprocs: int, train_params: TrainParams, m
         
         smooth_avg_reduced_loss_list, best_auc = train_one_epoch(local_rank=local_rank, train_loader=train_loader, valid_loader=valid_loader, model=model, criterion=criterion,
                                                                  optimizer=optimizer, nprocs=nprocs, idx_epoch=epoch, best_auc=best_auc, best_model_file=best_model_path,
-                                                                 original_valid_length=ori_valid_length, result_file=log_result_file)
+                                                                 original_valid_length=ori_valid_length, result_file=log_result_file, local_device=local_device, distributed=use_distributed)
         all_batch_avg_smooth_loss_list.extend(smooth_avg_reduced_loss_list)
         
         # adjust learning rate
@@ -273,14 +313,15 @@ def main_train_worker(local_rank: int, nprocs: int, train_params: TrainParams, m
 
 
 # https://hydra.cc/docs/tutorials/basic/your_first_app/defaults#overriding-a-config-group-default
-@hydra.main(config_path="../configs/", config_name="default.yaml")
+@hydra.main(version_base=None, config_path="../configs/", config_name="default")
 def main_app(config: DictConfig):
     # set seed for determinism for reproduction
     random.seed(config.Training.seed)
     np.random.seed(config.Training.seed)
     torch.manual_seed(config.Training.seed)
-    torch.cuda.manual_seed(config.Training.seed)
-    torch.cuda.manual_seed_all(config.Training.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(config.Training.seed)
+        torch.cuda.manual_seed_all(config.Training.seed)
     
     # setting hyper-parameter for Training / Model / Optimizer
     _train_params = TrainParams(processed_files_path=to_absolute_path(config.Data.preprocess_root), max_epochs=config.Training.max_epoches, train_bs=config.Training.train_batch_size, test_bs=config.Training.test_batch_size, external_func_vocab_file=to_absolute_path(config.Data.train_vocab_file), max_vocab_size=config.Data.max_vocab_size)
@@ -306,12 +347,15 @@ def main_app(config: DictConfig):
     params_print_log(_other_params, log_result_file)
     
     if config.Training.only_test_path == 'None':
-        os.environ['MASTER_ADDR'] = '127.0.0.1'
-        os.environ['MASTER_PORT'] = str(config.Training.dist_port)
-        # num_gpus = 1
         num_gpus = torch.cuda.device_count()
         log.info("Total number of GPUs = {}".format(num_gpus))
-        torch_mp.spawn(main_train_worker, nprocs=num_gpus, args=(num_gpus, _train_params, _model_params, _optim_params, log, log_result_file,))
+        if num_gpus > 0:
+            os.environ['MASTER_ADDR'] = '127.0.0.1'
+            os.environ['MASTER_PORT'] = str(config.Training.dist_port)
+            torch_mp.spawn(main_train_worker, nprocs=num_gpus, args=(num_gpus, _train_params, _model_params, _optim_params, log, log_result_file,))
+        else:
+            log.warning("No GPUs detected; falling back to single-process CPU training.")
+            main_train_worker(0, 1, _train_params, _model_params, _optim_params, log, log_result_file)
         
         best_model_file = os.path.join(os.getcwd(), 'LocalRank_{}_best_model.pt'.format(0))
     
@@ -320,7 +364,7 @@ def main_app(config: DictConfig):
     
     # model re-init and loading
     log.info("\n\nstarting to load the model & re-validation & testing from the file of \"{}\" \n".format(best_model_file))
-    device = torch.device('cuda')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     train_vocab_path = _train_params.external_func_vocab_file
     vocab = Vocab(freq_file=train_vocab_path, max_vocab_size=_train_params.max_vocab_size)
     
@@ -330,23 +374,23 @@ def main_app(config: DictConfig):
         raise NotImplementedError
     model.to(device)
     model.load_state_dict(torch.load(best_model_file, map_location=device))
-    criterion = nn.BCELoss().cuda()
+    criterion = nn.BCELoss().to(device)
     
     test_batch_size = config.Training.test_batch_size
     dataset_root_path = _train_params.processed_files_path
     # validation dataset & dataloader
     valid_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="validation")
-    valid_dataloader = DataLoaderX(dataset=valid_dataset, batch_size=test_batch_size, shuffle=False)
+    valid_dataloader = DataLoaderX(dataset=valid_dataset, batch_size=test_batch_size, shuffle=False, pin_memory=torch.cuda.is_available())
     log.info("Total number of all validation samples = {} ".format(len(valid_dataset)))
     
     # testing dataset & dataloader
     test_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="test")
-    test_dataloader = DataLoaderX(dataset=test_dataset, batch_size=test_batch_size, shuffle=False)
+    test_dataloader = DataLoaderX(dataset=test_dataset, batch_size=test_batch_size, shuffle=False, pin_memory=torch.cuda.is_available())
     log.info("Total number of all testing  samples = {} ".format(len(test_dataset)))
     
-    _valid_result = validate(valid_loader=valid_dataloader, model=model, criterion=criterion, evaluate_flag="DoubleCheckValidation", distributed=False, local_rank=None, nprocs=None, original_valid_length=len(valid_dataset), result_file=log_result_file, details=True)
+    _valid_result = validate(valid_loader=valid_dataloader, model=model, criterion=criterion, evaluate_flag="DoubleCheckValidation", distributed=False, local_rank=None, nprocs=None, original_valid_length=len(valid_dataset), result_file=log_result_file, details=True, local_device=device)
     log.warning("\n\n" + _valid_result.__str__())
-    _test_result = validate(valid_loader=test_dataloader, model=model, criterion=criterion, evaluate_flag="FinalTestingResult", distributed=False, local_rank=None, nprocs=None, original_valid_length=len(test_dataset), result_file=log_result_file, details=True)
+    _test_result = validate(valid_loader=test_dataloader, model=model, criterion=criterion, evaluate_flag="FinalTestingResult", distributed=False, local_rank=None, nprocs=None, original_valid_length=len(test_dataset), result_file=log_result_file, details=True, local_device=device)
     log.warning("\n\n" + _test_result.__str__())
 
 

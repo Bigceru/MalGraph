@@ -41,6 +41,50 @@ def find_threshold_with_fixed_fpr(y_true, y_pred, fpr_target):
     return _info
 
 
+def find_threshold_with_fixed_fnr(y_true, y_pred, fnr_target):
+    """Find the largest threshold whose FNR is at or below the target.
+    
+    This helper searches for an optimal decision threshold by iteratively decrementing
+    the threshold from 1.0 until the false negative rate reaches the specified target. Once found,
+    it computes the confusion matrix and derives TPR, accuracy, and balanced accuracy at that threshold.
+    
+    Args:
+        y_true: Ground truth binary labels (0 or 1).
+        y_pred: Predicted probabilities or continuous scores (typically from model output).
+        fnr_target: Target false negative rate (e.g., 0.01 for 1% FNR, 0.001 for 0.1% FNR).
+
+    Returns:
+        A formatted string summarizing the threshold and all derived metrics.
+    """
+    start_time = datetime.now()
+
+    # Start at threshold = 1.0 and move downward to get the highest threshold that still meets target FNR
+    threshold = 1.0
+    predicted = y_pred > threshold
+    tn, fp, fn, tp = confusion_matrix(y_true=y_true, y_pred=predicted, labels=[0, 1]).ravel()
+    fnr = float(fn) / float(fn + tp) if (fn + tp) else 0.0
+
+    # Decrement threshold until FNR drops below or equals the target
+    while fnr > fnr_target and threshold > 0.0:
+        threshold = max(0.0, threshold - 0.0001)  # Small step size for granular threshold search
+        predicted = y_pred > threshold
+        tn, fp, fn, tp = confusion_matrix(y_true=y_true, y_pred=predicted, labels=[0, 1]).ravel()
+        fnr = float(fn) / float(fn + tp) if (fn + tp) else 0.0
+
+    # Compute performance metrics at the found threshold
+    tpr = float(tp) / float(tp + fn) if (tp + fn) else 0.0
+    fpr = float(fp) / float(fp + tn) if (fp + tn) else 0.0
+    tnr = float(tn) / float(tn + fp) if (tn + fp) else 0.0
+    acc = float(tp + tn) / float(tn + fp + fn + tp) if (tn + fp + fn + tp) else 0.0
+    balanced_acc = balanced_accuracy_score(y_true=y_true, y_pred=predicted)
+    elapsed = datetime.now() - start_time
+
+    return (
+        "Threshold: {:.6f}, TN: {}, FP: {}, FN: {}, TP: {}, TPR: {:.6f}, FPR: {:.6f}, TNR: {:.6f}, FNR: {:.6f}, "
+        "ACC: {:.6f}, Balanced_ACC: {:.6f}. consume about {} time in find threshold"
+    ).format(threshold, tn, fp, fn, tp, tpr, fpr, tnr, fnr, acc, balanced_acc, elapsed)
+
+
 def alphabet_lower_strip(str1):
     return re.sub("[^A-Za-z]", "", str1).lower()
 

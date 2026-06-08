@@ -1,6 +1,5 @@
 import torch
 from torch_geometric.data import Batch
-from torch_geometric.data import DataLoader
 from pprint import pprint
 
 
@@ -21,4 +20,12 @@ def create_real_batch_data(one_batch: Batch):
         return (None for _ in range(6))
     else:
         real_batch = Batch.from_data_list(real)
-        return real_batch, position, one_batch.hash, one_batch.external_list, one_batch.function_edges, one_batch.targets
+
+        # Extract targets/labels from the batch - the result can be None if no labels are found
+        targets = getattr(one_batch, "targets", None)
+        if targets is None:
+            targets = getattr(one_batch, "labels", None)
+        if targets is None:
+            targets = getattr(one_batch, "y", None)
+
+        return real_batch, position, one_batch.hash, one_batch.external_list, one_batch.function_edges, targets
