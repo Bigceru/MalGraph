@@ -1,1 +1,1 @@
-"""MalGraph package."""
+"""MalGraph source package."""

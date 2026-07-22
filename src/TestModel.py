@@ -4,6 +4,8 @@ import os
 import threading
 import zipfile
 import uuid
+import json
+from argparse import ArgumentParser
 from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,13 +26,13 @@ from utils.Vocabulary import Vocab
 from utils.RealBatch import create_real_batch_data
 
 sys.path.append(str(Path("../samples")))  # Add the parent directory to the Python path
-from samples.PreProcess import preprocess_pe, process_json_to_pyg
 
+try:
+    from ..samples.PreProcess import preprocess_pe, process_json_to_pyg
+except ImportError as e:
+    from samples.PreProcess import preprocess_pe, process_json_to_pyg
 
 FILE_ANALYSIS_TIMEOUT_SECONDS = 300
-FILES_PATH = "../../Datasets/MalwareBazaar/Benign"         # Update this path to your dataset - ../../Datasets/MalwareBazaar/Benign
-VOCAB_PATH = "../train_external_function_name_vocab.jsonl"              # Update this path to your vocabulary file
-MODEL_CHECKPOINT_PATH = "outputs/2026-05-21"                                       # Directory to search for model checkpoints
 
 
 def _preprocess_worker(pe_file, model, vocab, device, threshold=0.5):
@@ -186,12 +188,13 @@ def find_training_log(model_path):
     return str(log_files[0])
 
 
-def load_model_from_path(model_path, log_path=None, global_log=None, device=None):
+def load_model_from_path(model_path, vocab_path, log_path=None, global_log=None, device=None):
     """
     Load a trained model from a checkpoint path using the saved training log.
 
     Args:
         model_path: Path to the saved model (.pt file)
+        vocab_path: Path to the vocabulary file
         log_path: Optional path to the training .txt log written by DistTrainModel.py
         global_log: Optional logger passed into the model constructor
         device: Optional torch device or device string
@@ -208,7 +211,7 @@ def load_model_from_path(model_path, log_path=None, global_log=None, device=None
     train_params, model_params = _load_params_from_log(log_path)
 
     # Initialize the vocabulary
-    vocab = Vocab(freq_file=VOCAB_PATH, max_vocab_size=train_params.max_vocab_size)
+    vocab = Vocab(freq_file=vocab_path, max_vocab_size=train_params.max_vocab_size)
 
     # Initialize the global logger
     if global_log is None:
@@ -292,7 +295,7 @@ def load_files(input_path: str) -> list:
     files = []
     # Cycle through all files in the directory and subdirectories
     for path in path.glob("**/*"):
-        if path.is_file(): # and path.suffix.lower() in {".exe", ".dll", ".sys", ".drv", ".ocx", ".scr", ".cpl", ".efi"}:  # Keep only "common" PE file extensions
+        if path.is_file() and path.suffix.lower() in {".exe", ".elf", ".dll", ".sys", ".drv", ".ocx", ".scr", ".cpl", ".efi"}:  # Keep only "common" PE file extensions
             files.append(path)
     if files:
         return files
@@ -393,23 +396,30 @@ def process_single_file(pe_file, model, vocab, device, threshold=0.5):
             predicted_label = {0: "Benign", 1: "Malware"}.get(predicted_class_idx)
             print(f"{pe_file.name}: {predicted_label} / {predicted_class_idx} - Prediction: {prediction.cpu().numpy()}")
             
-            return (str(pe_file), predicted_label)
+            return (str(pe_file), predicted_label, prob)
 
     except Exception as e:
         print(f"[Thread-{thread_id}] Error processing {pe_file}: {str(e)}")
-        return (str(pe_file), None)
+        return (str(pe_file), None, None)
 
 
 # Example usage:
 if __name__ == "__main__":
+    parser = ArgumentParser(description="User trained MalGraph model on a custom dataset of PE files")
+    parser.add_argument("--pe_file", type=str, default="../../Datasets/MalwareBazaar/Malware", help="Path to the directory containing PE files to test")
+    parser.add_argument("--vocab_path", type=str, default="../train_external_function_name_vocab.jsonl", help="Path to the vocabulary file")
+    parser.add_argument("--model_checkpoint_path", type=str, default="outputs/2026-05-21", help="Path to the directory containing model checkpoints")
+
+    args = parser.parse_args()
+
     try:
         # Search recursively through outputs/ for valid checkpoints
-        model_path = find_best_model(local_rank=0, search_dir=MODEL_CHECKPOINT_PATH)
-        model, vocab = load_model_from_path(model_path)
+        model_path = find_best_model(local_rank=0, search_dir=args.model_checkpoint_path)
+        model, vocab = load_model_from_path(model_path, args.vocab_path)
         print("Model loaded successfully via the saved checkpoint and training log.")
 
         # Test the model on the custom dataset
-        pe_files = load_files(FILES_PATH)
+        pe_files = load_files(args.pe_file)
         print(f"Loaded {len(pe_files)} PE files for testing.")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -493,14 +503,16 @@ if __name__ == "__main__":
         # Process completed tasks as they finish
         completed = 0
         not_processed = 0
+        probabilities = []
         for future in as_completed(future_to_file):
             completed += 1
             try:
-                file_path, predicted_class = future.result()
+                file_path, predicted_class, prob = future.result()
 
                 # If predicted_class is None, it means there was an error or the file was skipped during processing
                 if predicted_class is not None:
                     predictions[file_path] = predicted_class
+                    probabilities.append((file_path, prob))
                 else:
                     not_processed += 1
                 print(f"[Progress] Completed {completed}/{len(pe_files)} files")
@@ -515,6 +527,11 @@ if __name__ == "__main__":
         # Extract and print statistics
         stats = extract_statistics({Path(k): v for k, v in predictions.items()})
         print_statistics(stats)
+
+        # Save predictions to a JSON file
+        output_tag = args.pe_file.split('/')[-1]
+        with open(f"malgraph_model_probability_results-{output_tag}.json", "w") as f:
+            json.dump({str(file): float(prob) for file, prob in probabilities}, f, indent=4)
 
     except FileNotFoundError as exc:
         print(f"Error: {exc}")
