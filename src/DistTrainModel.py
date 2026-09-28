@@ -268,11 +268,11 @@ def main_train_worker(local_rank: int, nprocs: int, train_params: TrainParams, m
     test_batch_size = train_params.test_bs
     
     # training dataset & dataloader
-    train_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="train")
+    train_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="train", manifest_csv=train_params.manifest_file, file_types=train_params.file_types)
     train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset) if use_distributed else None
     train_loader = DataLoaderX(dataset=train_dataset, batch_size=train_batch_size, shuffle=not use_distributed, num_workers=0, pin_memory=use_cuda, sampler=train_sampler)
     # validation dataset & dataloader
-    valid_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="validation")
+    valid_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="validation", manifest_csv=train_params.manifest_file, file_types=train_params.file_types)
     valid_sampler = torch.utils.data.distributed.DistributedSampler(valid_dataset) if use_distributed else None
     valid_loader = DataLoaderX(dataset=valid_dataset, batch_size=test_batch_size, pin_memory=use_cuda, sampler=valid_sampler, shuffle=False)
     
@@ -324,7 +324,7 @@ def main_app(config: DictConfig):
         torch.cuda.manual_seed_all(config.Training.seed)
     
     # setting hyper-parameter for Training / Model / Optimizer
-    _train_params = TrainParams(processed_files_path=to_absolute_path(config.Data.preprocess_root), max_epochs=config.Training.max_epoches, train_bs=config.Training.train_batch_size, test_bs=config.Training.test_batch_size, external_func_vocab_file=to_absolute_path(config.Data.train_vocab_file), max_vocab_size=config.Data.max_vocab_size)
+    _train_params = TrainParams(processed_files_path=to_absolute_path(config.Data.preprocess_root), max_epochs=config.Training.max_epoches, train_bs=config.Training.train_batch_size, test_bs=config.Training.test_batch_size, external_func_vocab_file=to_absolute_path(config.Data.train_vocab_file), max_vocab_size=config.Data.max_vocab_size, manifest_file=(to_absolute_path(config.Data.manifest) if config.Data.manifest else None), file_types=(list(config.Data.file_types) if config.Data.file_types else None))
     _model_params = ModelParams(gnn_type=config.Model.gnn_type, pool_type=config.Model.pool_type, acfg_init_dims=config.Model.acfg_node_init_dims, cfg_filters=config.Model.cfg_filters, fcg_filters=config.Model.fcg_filters, number_classes=config.Model.number_classes, dropout_rate=config.Model.drapout_rate, ablation_models=config.Model.ablation_models)
     _optim_params = OptimizerParams(optimizer_name=config.Optimizer.name, lr=config.Optimizer.learning_rate, weight_decay=config.Optimizer.weight_decay, learning_anneal=config.Optimizer.learning_anneal)
     
@@ -379,12 +379,12 @@ def main_app(config: DictConfig):
     test_batch_size = config.Training.test_batch_size
     dataset_root_path = _train_params.processed_files_path
     # validation dataset & dataloader
-    valid_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="validation")
+    valid_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="validation", manifest_csv=_train_params.manifest_file, file_types=_train_params.file_types)
     valid_dataloader = DataLoaderX(dataset=valid_dataset, batch_size=test_batch_size, shuffle=False, pin_memory=torch.cuda.is_available())
     log.info("Total number of all validation samples = {} ".format(len(valid_dataset)))
     
     # testing dataset & dataloader
-    test_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="test")
+    test_dataset = MalwareDetectionDataset(root=dataset_root_path, train_or_test="test", manifest_csv=_train_params.manifest_file, file_types=_train_params.file_types)
     test_dataloader = DataLoaderX(dataset=test_dataset, batch_size=test_batch_size, shuffle=False, pin_memory=torch.cuda.is_available())
     log.info("Total number of all testing  samples = {} ".format(len(test_dataset)))
     

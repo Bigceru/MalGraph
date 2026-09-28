@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 
 
 @dataclass
@@ -10,6 +11,8 @@ class TrainParams:
     test_bs: int
     external_func_vocab_file: str
     max_vocab_size: int
+    manifest_file: Optional[str] = None
+    file_types: Optional[list] = None
 
 
 @dataclass

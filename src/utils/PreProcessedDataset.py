@@ -1,5 +1,7 @@
+import csv
 import os
 import os.path as osp
+import re
 from datetime import datetime
 
 import torch
@@ -10,8 +12,49 @@ from tqdm import tqdm
 from .RealBatch import create_real_batch_data  # noqa
 
 
+def _allowed_stems(manifest_csv, file_types, split=None):
+    """Returns a set of allowed stems (filenames without extensions) based on the manifest CSV and specified file types and split.
+    
+    Args:
+        manifest_csv (str): Path to the manifest CSV file containing file_type and split columns.
+        file_types (list): List of file types to include (e.g., ['pe_exe', 'pe_dll']). If None, all file types are allowed.
+        split (str, optional): The split to filter by (e.g., 'train', 'valid', 'test'). If None, no split filtering is applied.
+
+    Returns:
+        set: A set of allowed stems (lowercased) that match the specified file types and split. If file_types is None, returns None. Raises ValueError if file_types is specified but manifest_csv is not provided.
+    """
+    if not file_types:
+        return None
+    if not manifest_csv:
+        raise ValueError("file_types filtering requires a manifest CSV (with file_type/split columns)")
+    
+    wanted = set(file_types)
+    allowed = set()
+    with open(manifest_csv, "r", encoding="utf-8", newline="") as f:
+        for row in csv.DictReader(f):
+            # Skip rows that don't match the desired file types or split
+            if row.get("file_type", "").strip() not in wanted:
+                continue
+            if split is not None and row.get("split", "").strip() != split:
+                continue
+
+            # Extract the stem (filename without extension) from the malgraph_path or filename
+            ref = (row.get("malgraph_path") or "").strip()
+            stem = osp.splitext(osp.basename(ref))[0] if ref else ""
+
+            # If the stem is empty, try to extract a 64-character hex string from the filename
+            if not stem:
+                match = re.search(r"[0-9a-fA-F]{64}", row.get("filename", ""))
+                stem = match.group(0) if match else ""
+
+            # If we have a valid stem, add it to the allowed set (in lowercase)
+            if stem:
+                allowed.add(stem.lower())
+    return allowed
+
+
 class MalwareDetectionDataset(Dataset):
-    def __init__(self, root, train_or_test, transform=None, pre_transform=None):
+    def __init__(self, root, train_or_test, manifest_csv=None, file_types=None, transform=None, pre_transform=None):
         super(MalwareDetectionDataset, self).__init__(None, transform, pre_transform)
         self.flag = train_or_test.lower()
         self.malware_root = os.path.join(root, "{}".format(self.flag), "Malware")
@@ -22,6 +65,12 @@ class MalwareDetectionDataset(Dataset):
         # self.benign_files = self._collect_valid_pt_files(self.benign_root)
         self.malware_files = self._list_files_for_pt(self.malware_root)
         self.benign_files = self._list_files_for_pt(self.benign_root)
+
+        # Filter the files based on the manifest CSV and specified file types
+        allowed = _allowed_stems(manifest_csv, file_types, self.flag)
+        if allowed is not None:
+            self.malware_files = [f for f in self.malware_files if osp.splitext(f)[0].lower() in allowed]
+            self.benign_files = [f for f in self.benign_files if osp.splitext(f)[0].lower() in allowed]
     
     @staticmethod
     def _list_files_for_pt(the_path):
@@ -63,9 +112,11 @@ class MalwareDetectionDataset(Dataset):
         # split = 100
         if idx < split:
             idx_data = torch.load(osp.join(self.malware_root, self.malware_files[idx]), weights_only=False)
+            idx_data.targets = 1
         else:
             over_fit_idx = idx - split
             idx_data = torch.load(osp.join(self.benign_root, self.benign_files[over_fit_idx]), weights_only=False)
+            idx_data.targets = 0
         return idx_data
 
 

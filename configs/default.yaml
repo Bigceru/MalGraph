@@ -2,6 +2,8 @@ Data:
   preprocess_root: "/home/davide/Malware/Datasets/pe-machine-learning-dataset/pyg_data_v2"
   train_vocab_file: "../train_external_function_name_vocab.jsonl"
   max_vocab_size: 10000         # modify according to the result of BuildExternalVocab.py
+  manifest: null                # optional manifest CSV (file_type/split columns) for file-type filtering
+  file_types: null              # e.g. [pe_exe, pe_dll]; null = all types
 Training:
   cuda: True                    # enable GPU training if cuda is available
   dist_backend: "nccl"          # if using torch.distribution, the backend to be used
